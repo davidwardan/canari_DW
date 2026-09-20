@@ -8,3 +8,32 @@ statsmodels==0.14.4
 pytest==8.3.4
 optuna==4.2.0
 ray[tune]==2.49.2 
+
+# --- experiments/ only -------------------------------------------------------
+# Needed by experiments/llm_* (foundation-model forecasting and anomaly
+# detection). Not required by the canari library itself, so they are deliberately
+# absent from pyproject.toml's dependencies.
+#
+# scipy and PyYAML already arrive transitively (statsmodels -> scipy,
+# ray -> pyyaml) but the experiment scripts import them directly, so they are
+# declared rather than relied on. transformers, accelerate and einops come in
+# transitively with chronos-forecasting and are not listed.
+chronos-forecasting==2.3.1  # Chronos-2 and Chronos-Bolt pipelines; Chronos-2
+                            # needs the 2.x line
+torch>=2.2,<3               # the floor chronos-forecasting itself requires; left
+                            # unpinned because the right build is platform
+                            # specific -- on a CPU-only Linux server install with
+                            # --index-url https://download.pytorch.org/whl/cpu
+scipy==1.16.3
+PyYAML==6.0.3
+
+# Figures use matplotlib with text.usetex=True and save .pgf, which needs a system
+# LaTeX with amsmath/amssymb (e.g. texlive-latex-extra). Without it the runs still
+# work; only make_figures.py fails.
+#
+# The pins above are mutually satisfiable: chronos-forecasting 2.3.1 asks for
+# numpy>=1.21,<3 and pandas>=2.0,<4, which the numpy==1.26.0 and pandas==2.1.4
+# pinned earlier in this file both meet. Note only that the environment the
+# experiments were actually run in was newer (numpy 2.2.6, pandas 2.3.3,
+# matplotlib 3.10.9, ray 2.56.1, optuna 4.9.0, fire 0.7.1, torch 2.14.0), so
+# installing this file reproduces a working setup but not an identical one.

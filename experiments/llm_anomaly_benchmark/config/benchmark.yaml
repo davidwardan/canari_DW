@@ -1,0 +1,83 @@
+# LLM anomaly-detection benchmark.
+#
+# Key names mirror the upstream benchmark config
+# (Bayes-Works/canari @ feature/global-model, experiments/anomaly_detection_lstm.py)
+# so the two are directly comparable. Values are the upstream defaults unless a
+# comment says otherwise.
+
+experiment_name: llm_anomaly_benchmark
+
+# ---- Data -------------------------------------------------------------------
+values_file: data/hq_benchmark_data/weekly/weekly_values.csv
+datetimes_file: data/hq_benchmark_data/weekly/weekly_datetimes.csv
+series: null                      # null -> the same 10 series as the other experiments
+global_warmup_lookback_len: 52    # rows consumed as Auxiliary context, never modelled
+baseline_init_len: 52
+
+# Upstream pins validation_start / test_start as per-series timestamps in each
+# config. Ratios generalize that across 10 series of different lengths.
+validation_ratio: 0.2
+test_ratio: 0.3
+
+# ---- Foundation model (replaces the local/global LSTM) ----------------------
+model_id: amazon/chronos-2
+llm_horizon: 1                    # used only if llm_horizon_search_space is null
+# Horizons to sweep. Each is tuned independently (its own sigma_v grid and cdf
+# search) and then evaluated, so each H reports its best achievable operating
+# point. Differences across H therefore mix the horizon with its retuning.
+llm_horizon_search_space: [1, 3, 6, 13, 26, 52, 104, 208]
+
+# ---- sigma_v grid search ----------------------------------------------------
+optimize_sigma_v: true
+sigma_v: 0.1                      # used when optimize_sigma_v is false
+sigma_v_search_space: [0.02, 0.04, 0.06, 0.08, 0.1, 0.125, 0.15, 0.175, 0.2]
+sigma_v_selection_delta: 0.0      # pick the smallest sigma_v within this of the best
+early_stopping_metric: crps       # 'crps' or 'll'; upstream default is crps
+
+# ---- SKF parameter optimization ---------------------------------------------
+optimize_skf_parameters: true
+skf_objective_function: cdf       # 'll' or 'cdf'
+num_optimization_trial: 50
+num_startup_trials: 20
+std_transition_error: 1.0e-5
+norm_to_abnorm_prob: 1.0e-5
+abnorm_to_norm_prob: 0.1
+anomaly_detection_threshold: 0.4
+std_transition_error_search_space: [5.0e-6, 1.0e-4]
+norm_to_abnorm_prob_search_space: [1.0e-5, 1.0e-4]
+abnorm_to_norm_prob_search_space: [0.1, 0.2]
+threshold_search_space: [0.05, 0.5]
+
+# Only used when skf_objective_function is 'cdf'.
+# `cdf_num_anomaly` is the single biggest cost driver: every optimization trial
+# filters 2 x cdf_num_anomaly realizations plus one clean pass.
+slope: 0.5
+cdf_num_anomaly: 50
+cdf_anomaly_start: 0.25
+cdf_anomaly_end: 0.75
+
+# Shape of SKF.objective. The installed canari ships different defaults from
+# upstream (detection_rate_cdf_std 0.5 vs 0.2, anm_mag_cdf_median 0.3 vs 0.2,
+# anm_mag_cdf_shape 0.4 vs 0.6), so these are passed explicitly to score the same
+# way upstream does rather than inheriting whichever defaults are installed.
+objective_detection_rate_cdf_mean: 0.5
+objective_detection_rate_cdf_std: 0.2
+objective_false_rate_cdf_median: 0.1
+objective_false_rate_cdf_shape: 0.2
+objective_anm_mag_cdf_median: 0.2
+objective_anm_mag_cdf_shape: 0.6
+
+# ---- Multi-realization evaluation -------------------------------------------
+num_anomaly_realizations: 25      # x2, because each magnitude is injected up and down
+slope_search_space: [0.025, 0.05, 0.075, 0.225, 0.5, 0.75, 1.0]
+max_timestep_to_detect: 156       # three years
+
+# ---- Execution ---------------------------------------------------------------
+seeds: [0]                        # Chronos-2 is deterministic; seed spread is not a
+                                  # source of variability here, unlike the LSTM
+num_workers: null                 # per-case CPU budget; set automatically when
+                                  # the driver runs cases in parallel
+max_concurrent: null              # (H, series) cases to run side by side.
+                                  # null -> chosen to minimise wall clock, since
+                                  # H=1 costs far more than H=208 and one core
+                                  # each would leave it setting the wall time.

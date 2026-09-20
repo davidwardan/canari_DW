@@ -1,0 +1,102 @@
+# Full sweep: 10 series x 8 horizons = 80 cases, Chronos-Bolt-tiny.
+#
+#   python scripts/benchmark.py --config_path config/full_bolt_tiny.yaml
+#
+# Sizing for a 48-core server, leaving 4 cores free:
+#   cpus: 44            cores the driver may use (48 - 4)
+#   max_concurrent: 11  cases side by side, 4 CPUs each
+#
+# 11 rather than the 22 that pure speed would pick: wall clock is nearly flat
+# across that range (15.4 h at 22, 15.9 h at 11) but each concurrent case runs its
+# own local Ray instance, so halving the count cuts peak RAM from roughly 29 GB to
+# 22 GB and halves the number of Ray clusters on the box. Ray's object store is
+# also pinned to 256 MB per instance; its default is ~30% of system RAM, which
+# multiplied by 11 would exhaust the server.
+#
+# Estimated 571 core-hours -> ~16 h wall. `--dry_run True` reprints this for any
+# edit. Tuning checkpoints per (H, series), so an interrupted run resumes on the
+# same --output_dir.
+#
+# cdf_num_anomaly stays at upstream's 50: the SKF search is ~80% of the cost and
+# dropping it to 10 would cut the run to ~4 h, but it is left at full fidelity
+# since 16 h is an overnight job.
+
+experiment_name: llm_anomaly_benchmark_full_bolt_tiny
+values_file: data/hq_benchmark_data/weekly/weekly_values.csv
+datetimes_file: data/hq_benchmark_data/weekly/weekly_datetimes.csv
+series: null
+global_warmup_lookback_len: 52
+baseline_init_len: 52
+validation_ratio: 0.2
+test_ratio: 0.3
+model_id: amazon/chronos-bolt-tiny
+llm_horizon: 1
+llm_horizon_search_space:
+- 1
+- 3
+- 6
+- 13
+- 26
+- 52
+- 104
+- 208
+optimize_sigma_v: true
+sigma_v: 0.1
+sigma_v_search_space:
+- 0.02
+- 0.04
+- 0.06
+- 0.08
+- 0.1
+- 0.125
+- 0.15
+- 0.175
+- 0.2
+sigma_v_selection_delta: 0.0
+early_stopping_metric: crps
+optimize_skf_parameters: true
+skf_objective_function: cdf
+num_optimization_trial: 100
+num_startup_trials: 50
+std_transition_error: 1.0e-05
+norm_to_abnorm_prob: 1.0e-05
+abnorm_to_norm_prob: 0.1
+anomaly_detection_threshold: 0.4
+std_transition_error_search_space:
+- 5.0e-06
+- 0.0001
+norm_to_abnorm_prob_search_space:
+- 1.0e-05
+- 0.0001
+abnorm_to_norm_prob_search_space:
+- 0.1
+- 0.2
+threshold_search_space:
+- 0.05
+- 0.5
+slope: 0.5
+cdf_num_anomaly: 50
+cdf_anomaly_start: 0.25
+cdf_anomaly_end: 0.75
+objective_detection_rate_cdf_mean: 0.5
+objective_detection_rate_cdf_std: 0.2
+objective_false_rate_cdf_median: 0.1
+objective_false_rate_cdf_shape: 0.2
+objective_anm_mag_cdf_median: 0.2
+objective_anm_mag_cdf_shape: 0.6
+num_anomaly_realizations: 25
+slope_search_space:
+- 0.025
+- 0.05
+- 0.075
+- 0.225
+- 0.5
+- 0.75
+- 1.0
+max_timestep_to_detect: 156
+seeds:
+- 0
+num_workers: null
+max_concurrent: 11
+cpus: 44
+ray_object_store_mb: 256
