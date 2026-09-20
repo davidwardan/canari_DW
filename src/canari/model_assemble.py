@@ -174,10 +174,12 @@ class ModelAssemble:
             ) = self.forward(x, posterior_covariate, update_param_covar_model)
 
             for model in [self.target_model] + self.covariate_model:
-                if model.lstm_net or model.aux_predict_fn:
+                if model.lstm_net:
                     model.update_lstm_output_history(
                         model.mu_states_prior, model.var_states_prior
                     )
+                elif model.aux_component:
+                    model.update_aux_context(model.mu_states_prior)
 
                 model._set_posterior_states(
                     model.mu_states_prior, model.var_states_prior
@@ -237,10 +239,8 @@ class ModelAssemble:
                     model.update_lstm_output_history(
                         model.mu_states_posterior, model.var_states_posterior
                     )
-                elif model.aux_predict_fn:
-                    model.update_lstm_output_history(
-                        model.mu_states_posterior, model.var_states_posterior
-                    )
+                elif model.aux_component:
+                    model.update_aux_context(model.mu_states_posterior)
                 model.save_states_history()
                 model.set_states(model.mu_states_posterior, model.var_states_posterior)
 

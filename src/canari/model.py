@@ -153,6 +153,10 @@ class Model:
         cls = self.__class__
         obj = cls.__new__(cls)
         memo[id(self)] = obj
+        if self.aux_component is not None:
+            # Share it: it owns the external forecaster and the growing context,
+            # which must stay unique across copies (e.g. SKF's transition models).
+            memo[id(self.aux_component)] = self.aux_component
         for k, v in self.__dict__.items():
             if k in ["lstm_net"]:
                 v = None
@@ -191,9 +195,8 @@ class Model:
         self.lstm_output_history = LstmOutputHistory()
         self.lstm_states_history = []
 
-        # Auxiliary (external one-step predictor) attributes
-        self.aux_predict_fn = None
-        self.aux_look_back_len = None
+        # Auxiliary (external forecaster) component, if present
+        self.aux_component = None
 
         # Autoregression-related attributes
         self.mu_W2bar = None
@@ -328,9 +331,7 @@ class Model:
                 raise ValueError(
                     "LstmNetwork and Auxiliary components cannot be used together."
                 )
-            self.aux_predict_fn = aux_component.predict_fn
-            self.aux_look_back_len = aux_component.look_back_len
-            self.lstm_output_history.initialize(self.aux_look_back_len)
+            self.aux_component = aux_component
 
     def _predictor_states_index(self) -> Optional[int]:
         """Return the state index of the external-predictor slot
@@ -1125,6 +1126,19 @@ class Model:
             var_states[lstm_index, lstm_index],
         )
 
+    def update_aux_context(self, mu_states: np.ndarray):
+        """
+        Append the auxiliary hidden state to the growing context of the
+        :class:`~canari.component.auxiliary_component.Auxiliary` component, so that
+        the external forecaster sees one more time step at its next call.
+
+        Args:
+            mu_states (np.ndarray): State mean vector the auxiliary value is taken from.
+        """
+
+        aux_index = self._predictor_states_index()
+        self.aux_component.update_context(mu_states[aux_index])
+
     def get_dict(self, time_step: Optional[int] = None) -> dict:
         """
         Export model attributes into a serializable dictionary.
@@ -1222,22 +1236,64 @@ class Model:
         """
 
         trend, slope, _, _ = DataProcess.decompose_data(data.flatten())
+        self._set_baseline_states(level=trend[0], slope=slope)
+
+    def _set_baseline_states(self, level: float, slope: float):
+        """
+        Assign means and variances for the baseline hidden states.
+
+        Args:
+            level (float): Initial mean for the level state.
+            slope (float): Initial mean for the trend state.
+        """
 
         for i, _state_name in enumerate(self.states_name):
             if _state_name == "level":
-                self.mu_states[i] = trend[0]
+                self.mu_states[i] = level
                 if self.var_states[i, i] == 0:
-                    self.var_states[i, i] = 1e-2
+                    self.var_states[i, i] = 1e-4
             elif _state_name == "trend":
                 self.mu_states[i] = slope
                 if self.var_states[i, i] == 0:
-                    self.var_states[i, i] = 1e-6
+                    self.var_states[i, i] = 1e-5
             elif _state_name == "acceleration":
                 self.mu_states[i] = 0
                 if self.var_states[i, i] == 0:
                     self.var_states[i, i] = 1e-6
 
-        self._mu_local_level = trend[0]
+        self._mu_local_level = level
+
+    def initialize_from_context(self, data: np.ndarray):
+        """
+        Consume a leading segment of a time series as context rather than filtering it.
+
+        The segment is decomposed with
+        :meth:`~canari.data_process.DataProcess.decompose_data`; its linear trend
+        initializes the baseline hidden states **at the end** of the segment, so that
+        filtering can resume at the next time step, and what the trend does not
+        explain seeds the context of the
+        :class:`~canari.component.auxiliary_component.Auxiliary` component, in the
+        units that component appends at every filtered step.
+
+        Use it together with :meth:`~canari.data_process.DataProcess.split_at` to
+        start filtering partway into a series while the earlier part still serves as
+        context for the external forecaster.
+
+        Args:
+            data (np.ndarray): The leading segment of the time series.
+
+        Examples:
+            >>> context_data, filter_data = DataProcess.split_at(all_data, 100)
+            >>> model.initialize_from_context(context_data["y"])
+            >>> mu_preds, std_preds, states = model.filter(data=filter_data)
+        """
+
+        data = data.flatten()
+        trend, slope, _, _ = DataProcess.decompose_data(data)
+        self._set_baseline_states(level=trend[-1], slope=slope)
+
+        if self.aux_component:
+            self.aux_component.set_context(data - trend)
 
     def set_states(
         self,
@@ -1439,7 +1495,9 @@ class Model:
 
         # External predictor prediction (LSTM or Auxiliary):
         lstm_states_index = self._predictor_states_index()
-        if (self.lstm_net or self.aux_predict_fn) and mu_lstm_pred is None and var_lstm_pred is None:
+        if self.aux_component and mu_lstm_pred is None and var_lstm_pred is None:
+            mu_lstm_pred, var_lstm_pred = self.aux_component.predict()
+        elif self.lstm_net and mu_lstm_pred is None and var_lstm_pred is None:
             if var_input_covariates is not None:
                 mu_lstm_input, var_lstm_input = common.prepare_lstm_input(
                     self.lstm_output_history, input_covariates, var_input_covariates
@@ -1449,24 +1507,17 @@ class Model:
                     self.lstm_output_history, input_covariates
                 )
 
-            if self.lstm_net:
-                mu_lstm_pred, var_lstm_pred = self.lstm_net.forward(
-                    mu_x=np.float32(mu_lstm_input), var_x=np.float32(var_lstm_input)
-                )
+            mu_lstm_pred, var_lstm_pred = self.lstm_net.forward(
+                mu_x=np.float32(mu_lstm_input), var_x=np.float32(var_lstm_input)
+            )
 
-                # Heteroscedastic noise
-                if self.lstm_net.model_noise:
-                    mu_v2bar_prior = mu_lstm_pred[1::2]
-                    var_v2bar_prior = var_lstm_pred[1::2]
-                    mu_lstm_pred = mu_lstm_pred[0::2]
-                    var_lstm_pred = var_lstm_pred[0::2]
-                    self._estim_hete_noise(mu_v2bar_prior, var_v2bar_prior)
-            else:
-                mu_lstm_pred, var_lstm_pred = self.aux_predict_fn(
-                    mu_lstm_input, var_lstm_input
-                )
-                mu_lstm_pred = np.atleast_1d(np.asarray(mu_lstm_pred, dtype=float))
-                var_lstm_pred = np.atleast_1d(np.asarray(var_lstm_pred, dtype=float))
+            # Heteroscedastic noise
+            if self.lstm_net.model_noise:
+                mu_v2bar_prior = mu_lstm_pred[1::2]
+                var_v2bar_prior = var_lstm_pred[1::2]
+                mu_lstm_pred = mu_lstm_pred[0::2]
+                var_lstm_pred = var_lstm_pred[0::2]
+                self._estim_hete_noise(mu_v2bar_prior, var_v2bar_prior)
 
         # State-space model prediction:
         mu_obs_pred, var_obs_pred, mu_states_prior, var_states_prior = common.forward(
@@ -1709,8 +1760,8 @@ class Model:
             if self.lstm_net:
                 self.update_lstm_states_history(index, last_step=len(data["y"]) - 1)
                 self.update_lstm_output_history(mu_states_prior, var_states_prior)
-            elif self.aux_predict_fn:
-                self.update_lstm_output_history(mu_states_prior, var_states_prior)
+            elif self.aux_component:
+                self.update_aux_context(mu_states_prior)
 
             # Store variables
             self._set_posterior_states(mu_states_prior, var_states_prior)
@@ -1795,10 +1846,8 @@ class Model:
                 self.update_lstm_output_history(
                     mu_states_posterior, var_states_posterior
                 )
-            elif self.aux_predict_fn:
-                self.update_lstm_output_history(
-                    mu_states_posterior, var_states_posterior
-                )
+            elif self.aux_component:
+                self.update_aux_context(mu_states_posterior)
 
             # Store variables
             self.save_states_history()

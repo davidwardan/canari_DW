@@ -320,6 +320,52 @@ class DataProcess:
                 "freq": freq,
             }
 
+    @staticmethod
+    def split_at(
+        data: Dict[str, np.ndarray],
+        split_point,
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+        """
+        Split a data dictionary in two at a given point in time.
+
+        Typical use is to set aside a leading segment of a time series to be used
+        only as context for an external forecaster (see
+        :class:`~canari.component.auxiliary_component.Auxiliary`), while the
+        state-space model filters the remaining segment.
+
+        Args:
+            data (Dict[str, np.ndarray]): A data dictionary from :meth:`get_splits`.
+            split_point (int or timestamp): Index, or a time-index label, of the first
+                time step of the second segment.
+
+        Returns:
+            Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+                The segments before and from `split_point`.
+
+        Examples:
+            >>> train_set, val_set, test_set, all_data = dp.get_splits()
+            >>> context_data, filter_data = DataProcess.split_at(all_data, 100)
+            >>> context_data, filter_data = DataProcess.split_at(all_data, "2020-01-01")
+        """
+
+        if not isinstance(split_point, (int, np.integer)):
+            split_point = data["time"].get_loc(split_point)
+        if not 0 < split_point < len(data["y"]):
+            raise ValueError(
+                f"split_point {split_point} is outside the data "
+                f"(length {len(data['y'])})."
+            )
+
+        segments = []
+        for time_slice in (slice(None, split_point), slice(split_point, None)):
+            segment = dict(data)
+            for key in ("x", "y", "time"):
+                segment[key] = data[key][time_slice]
+            if "start_date" in segment:
+                segment["start_date"] = segment["time"][0]
+            segments.append(segment)
+        return segments[0], segments[1]
+
     def get_data(
         self,
         split: str,
