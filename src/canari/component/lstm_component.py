@@ -29,6 +29,14 @@ class LstmNetwork(BaseComponent):
                                     Defaults to None (random initialization).
         gain_weight (Optional[int]): Scaling factor for weight initialization. Defaults to 1.
         gain_bias (Optional[int]): Scaling factor for bias initialization. Defaults to 1.
+        recurrent_gain_weight (Optional[float]): Recurrent-layer weight gain. When None,
+            uses `gain_weight`. Defaults to None.
+        recurrent_gain_bias (Optional[float]): Recurrent-layer bias gain. When None,
+            uses `gain_bias`. Defaults to None.
+        readout_gain_weight (Optional[float]): Readout-layer weight gain. When None,
+            uses `gain_weight`. Defaults to None.
+        readout_gain_bias (Optional[float]): Readout-layer bias gain. When None,
+            uses `gain_bias`. Defaults to None.
         load_lstm_net (Optional[str]): Path to a saved LSTM network file containing pretrained
                                         LSTM's weights and biases. Defaults to None.
         mu_states (Optional[list[float]]): Initial mean of the hidden state. Defaults:
@@ -79,13 +87,17 @@ class LstmNetwork(BaseComponent):
         device: Optional[str] = "cpu",
         num_thread: Optional[int] = 1,
         manual_seed: Optional[int] = None,
-        gain_weight: Optional[int] = 1,
-        gain_bias: Optional[int] = 1,
+        gain_weight: Optional[float] = 1,
+        gain_bias: Optional[float] = 1,
         load_lstm_net: Optional[str] = None,
         load_lstm_look_back: Optional[tuple] = None,
         mu_states: Optional[list[float]] = None,
         var_states: Optional[list[float]] = None,
         smoother: Optional[bool] = True,
+        recurrent_gain_weight: Optional[float] = None,
+        recurrent_gain_bias: Optional[float] = None,
+        readout_gain_weight: Optional[float] = None,
+        readout_gain_bias: Optional[float] = None,
     ):
         self.std_error = std_error
         self.num_layer = num_layer
@@ -99,6 +111,10 @@ class LstmNetwork(BaseComponent):
         self.manual_seed = manual_seed
         self.gain_weight = gain_weight
         self.gain_bias = gain_bias
+        self.recurrent_gain_weight = recurrent_gain_weight
+        self.recurrent_gain_bias = recurrent_gain_bias
+        self.readout_gain_weight = readout_gain_weight
+        self.readout_gain_bias = readout_gain_bias
         self.load_lstm_net = load_lstm_net
         self.load_lstm_look_back = load_lstm_look_back
         self._mu_states = mu_states
@@ -159,6 +175,34 @@ class LstmNetwork(BaseComponent):
             pytagi.manual_seed(self.manual_seed)
 
         layers = []
+        recurrent_gain_weight = (
+            self.gain_weight
+            if self.recurrent_gain_weight is None
+            else self.recurrent_gain_weight
+        )
+        recurrent_gain_bias = (
+            self.gain_bias
+            if self.recurrent_gain_bias is None
+            else self.recurrent_gain_bias
+        )
+        stacked_recurrent_gain_weight = (
+            1.0
+            if self.recurrent_gain_weight is None
+            else self.recurrent_gain_weight
+        )
+        stacked_recurrent_gain_bias = (
+            1.0 if self.recurrent_gain_bias is None else self.recurrent_gain_bias
+        )
+        readout_gain_weight = (
+            self.gain_weight
+            if self.readout_gain_weight is None
+            else self.readout_gain_weight
+        )
+        readout_gain_bias = (
+            self.gain_bias
+            if self.readout_gain_bias is None
+            else self.readout_gain_bias
+        )
         if isinstance(self.num_hidden_unit, int):
             self.num_hidden_unit = [self.num_hidden_unit] * self.num_layer
         if self.smoother:
@@ -167,13 +211,19 @@ class LstmNetwork(BaseComponent):
                     self.num_features + self.look_back_len - 1,
                     self.num_hidden_unit[0],
                     1,
-                    gain_weight=self.gain_weight,
-                    gain_bias=self.gain_bias,
+                    gain_weight=recurrent_gain_weight,
+                    gain_bias=recurrent_gain_bias,
                 )
             )
             for i in range(1, self.num_layer):
                 layers.append(
-                    SLSTM(self.num_hidden_unit[i], self.num_hidden_unit[i], 1)
+                    SLSTM(
+                        self.num_hidden_unit[i],
+                        self.num_hidden_unit[i],
+                        1,
+                        gain_weight=stacked_recurrent_gain_weight,
+                        gain_bias=stacked_recurrent_gain_bias,
+                    )
                 )
             # Last layer
             layers.append(
@@ -181,8 +231,8 @@ class LstmNetwork(BaseComponent):
                     self.num_hidden_unit[-1],
                     self.num_output,
                     1,
-                    gain_weight=self.gain_weight,
-                    gain_bias=self.gain_bias,
+                    gain_weight=readout_gain_weight,
+                    gain_bias=readout_gain_bias,
                 )
             )
         else:
@@ -191,20 +241,28 @@ class LstmNetwork(BaseComponent):
                     self.num_features + self.look_back_len - 1,
                     self.num_hidden_unit[0],
                     1,
-                    gain_weight=self.gain_weight,
-                    gain_bias=self.gain_bias,
+                    gain_weight=recurrent_gain_weight,
+                    gain_bias=recurrent_gain_bias,
                 )
             )
             for i in range(1, self.num_layer):
-                layers.append(LSTM(self.num_hidden_unit[i], self.num_hidden_unit[i], 1))
+                layers.append(
+                    LSTM(
+                        self.num_hidden_unit[i],
+                        self.num_hidden_unit[i],
+                        1,
+                        gain_weight=stacked_recurrent_gain_weight,
+                        gain_bias=stacked_recurrent_gain_bias,
+                    )
+                )
             # Last layer
             layers.append(
                 Linear(
                     self.num_hidden_unit[-1],
                     self.num_output,
                     1,
-                    gain_weight=self.gain_weight,
-                    gain_bias=self.gain_bias,
+                    gain_weight=readout_gain_weight,
+                    gain_bias=readout_gain_bias,
                 )
             )
         # Initialize lstm network

@@ -1,44 +1,29 @@
+# Experiment folders and their outputs. Everything under experiments/ is scratch
+# work; only library changes under src/ are meant to surface in git status.
+experiments/
+
 build
+dist/
+*.egg-info/
+**/__pycache__/
 *.DS_Store
 *.vscode
 *.json
-saved_results/
-**/__pycache__/
-*.egg-info/
 *.png
-dist/
-data/demo_data
-data/benchmark_data/
+
+data/
 saved_params/
+saved_results/
+results/
+epistemic/
+logs/
+tmp/
+Figures/
 
 # Docs
 docs/_build/*
 !docs/_build/html/
-
-# Figures
-!saved_results/time_series_toy.png
 !docs/_static/**
-!experiments/figures/
-!experiments/out/
 
 AGENTS.md
 .claude/*
-experiments/out
-experiments/planning
-data/
-
-
-# MD files
-experiments/*.md
-
-# plotting scripts
-experiments/plot_*.py
-
-# epistemic uncertainty exploration
-epistemic/*
-
-logs/*
-experiments/config/*
-experiments/notebooks/*
-experiments/extras/*
-Figures/*

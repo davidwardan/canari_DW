@@ -154,7 +154,7 @@ def test_online_predictions_are_sliced_to_the_validation_span(
         def __init__(self):
             self.call = None
 
-        def online_lstm_filter(self, data, start, window_len, end):
+        def rsr_filter(self, data, start, window_len, end):
             self.call = (start, window_len, end)
             return np.arange(start, end), np.ones(end - start), None
 

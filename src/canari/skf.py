@@ -1229,32 +1229,6 @@ class SKF:
             self.states,
         )
 
-    def online_lstm_filter(
-        self,
-        data: Dict[str, np.ndarray],
-        window_len: int,
-        end: Optional[int] = None,
-    ) -> Tuple[np.ndarray, StatesHistory]:
-        """Filter from the beginning with fixed-lag online LSTM updates.
-
-        The first window supplies the initial state and probability history. Each later
-        window contributes its newest step, so the returned values align with
-        ``data[:end]`` like the output of :meth:`filter`.
-
-        Args:
-            data (Dict[str, np.ndarray]): Complete series containing ``x`` and ``y``.
-            window_len (int): Fixed smoothing lag.
-            end (Optional[int]): Exclusive final index. Defaults to the end of ``data``.
-
-        Returns:
-            Tuple[np.ndarray, StatesHistory]: Online abnormal-model probabilities and
-            state estimates for ``data[:end]``.
-        """
-
-        from canari.online_lstm import online_filter_skf
-
-        return online_filter_skf(self, data, window_len, end)
-
     def smoother(self) -> Tuple[np.ndarray, StatesHistory]:
         """
         Run the Kalman smoother over an entire time series data.

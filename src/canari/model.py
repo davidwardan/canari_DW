@@ -875,15 +875,15 @@ class Model:
             if _state_name == "level":
                 self.mu_states[i] = trend[0]
                 if self.var_states[i, i] == 0:
-                    self.var_states[i, i] = 1e-6
+                    self.var_states[i, i] = 1e-5
             elif _state_name == "trend":
                 self.mu_states[i] = slope
                 if self.var_states[i, i] == 0:
-                    self.var_states[i, i] = 1e-6
+                    self.var_states[i, i] = 1e-5
             elif _state_name == "acceleration":
                 self.mu_states[i] = 0
                 if self.var_states[i, i] == 0:
-                    self.var_states[i, i] = 1e-5
+                    self.var_states[i, i] = 1e-6
 
         self._mu_local_level = trend[0]
 
@@ -1283,35 +1283,57 @@ class Model:
             self.states,
         )
 
-    def online_lstm_filter(
+    def rsr_filter(
         self,
         data: Dict[str, np.ndarray],
         start: int,
         window_len: int,
+        strategy: Optional[str] = "replay_smoothed",
         end: Optional[int] = None,
+        include_warmup: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray, StatesHistory]:
-        """Filter a time range while updating the LSTM with fixed-lag smoothing.
+        """
+        Filter a time range while the LSTM keeps learning, using Recurrent Smoothing and
+        Replay (RSR). Recall :meth:`~canari.rsr.rsr_filter` from :class:`~canari.rsr`.
 
-        The model is first carried from the beginning of ``data`` to
-        ``start - window_len`` with frozen LSTM parameters. It then uses overlapping
-        windows of ``window_len + 1`` observations: filter forward, update the LSTM,
-        smooth backward, rewind one step, and repeat. The returned predictions align
-        with ``data[start:end]``.
+        The model is first carried from the beginning of `data` to `start - window_len`
+        with frozen LSTM parameters. It then walks overlapping windows of
+        `window_len + 1` observations: update the LSTM over the window, smooth the window
+        backwards, restart one step later, and repeat. By default, returned predictions
+        align with `data[start:end]`; with `include_warmup=True`, the first window is
+        included as well.
 
         Args:
-            data (Dict[str, np.ndarray]): Complete series containing ``x`` and ``y``.
-            start (int): Index of the first returned online prediction.
-            window_len (int): Fixed smoothing lag.
-            end (Optional[int]): Exclusive final index. Defaults to the end of ``data``.
+            data (Dict[str, np.ndarray]): Complete series containing 'x' and 'y'.
+            start (int): Index of the first normal returned online prediction.
+            window_len (int): Number of steps a window looks back over.
+            strategy (str, optional): How the state-space model is handled while the LSTM
+                replays a window: 'cached_filtered', 'cached_smoothed', 'replay_filtered',
+                or 'replay_smoothed'. Defaults to "replay_smoothed".
+            end (Optional[int]): Exclusive final index. Defaults to the end of `data`.
+            include_warmup (bool): Include the first replay window's states and
+                predictions before `start`. Defaults to False.
 
         Returns:
-            Tuple[np.ndarray, np.ndarray, StatesHistory]: Online predictive means,
-            standard deviations, and state estimates for ``data[start:end]``.
+            Tuple[np.ndarray, np.ndarray, StatesHistory]:
+                A tuple containing:
+
+                - **mu_obs_preds** (np.ndarray):
+                    The means for the online one-step-ahead predictions.
+                - **std_obs_preds** (np.ndarray):
+                    The standard deviations for the online one-step-ahead predictions.
+                - :attr:`states`:
+                    The history of hidden states over `data[start:end]`.
+
+        Examples:
+            >>> mu_preds, std_preds, states = model.rsr_filter(
+            ...     data, start=104, window_len=52
+            ... )
         """
 
-        from canari.online_lstm import online_filter_model
+        from canari.rsr import rsr_filter
 
-        return online_filter_model(self, data, start, window_len, end)
+        return rsr_filter(self, data, start, window_len, strategy, end, include_warmup)
 
     def smoother(self) -> StatesHistory:
         """
