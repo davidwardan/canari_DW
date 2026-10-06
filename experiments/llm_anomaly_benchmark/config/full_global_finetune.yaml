@@ -1,0 +1,112 @@
+# Upstream's global_finetune condition on the LLM benchmark: the recurrent slot
+# holds the global LSTM saved_params/global_model.bin (1 layer x 50 units,
+# lookback 52, week_of_year covariate), fine-tuned per series from those weights,
+# instead of a foundation model.
+#
+# The file really is 50 units: it loads only as LSTM(53->50) + Linear(50->1).
+# An earlier run from the 256-unit seed_variability weights is kept as
+# results/full_local (config/full_local.yaml).
+#
+# Data, splits, sigma_v grid, SKF search space and objective, and the evaluation
+# are those of full_chronos2_small_zerovar_residual.yaml, so every case runs on the
+# same series and the same synthetic realizations as the LLM sweep
+# (scripts/check_same_inputs.py asserts it). There is no H: the LSTM runs at every
+# step. The cases are (seed, series) instead of (H, series).
+#
+#   python scripts/benchmark.py --config_path config/full_global_finetune.yaml
+#
+# One weights file, so one seed: pytagi's initial variances do not depend on the
+# seed and the means are the file's, so extra seeds would repeat the same run.
+# (A `{seed}` placeholder in lstm_global_params selects one file per seed.)
+# 10 cases, 4 CPUs each on 44 cores.
+experiment_name: llm_anomaly_benchmark_full_global_finetune
+condition: global_finetune
+values_file: data/hq_benchmark_data/weekly/weekly_values.csv
+datetimes_file: data/hq_benchmark_data/weekly/weekly_datetimes.csv
+series: null
+global_warmup_lookback_len: 52
+baseline_init_len: 52
+validation_ratio: 0.15
+test_ratio: 0.5
+time_covariates:
+- week_of_year
+
+# ---- Global LSTM (upstream keys) ---------------------------------------------
+lstm_global_params: saved_params/global_model.bin   # relative to the repository root
+lstm_look_back_len: 52
+lstm_num_features: 2              # the 52-step lookback plus week_of_year
+lstm_num_layer: 1
+num_hidden_unit: 50               # what global_model.bin holds
+lstm_num_epoch: 500               # upstream default; early stopping (patience 20) ends it
+
+optimize_sigma_v: true
+sigma_v: 0.1
+sigma_v_search_space:
+- 0.01
+- 0.02
+- 0.04
+- 0.06
+- 0.08
+- 0.1
+- 0.125
+- 0.15
+- 0.175
+- 0.2
+sigma_v_selection_delta: 0.0
+early_stopping_metric: ll         # also the LSTM's early-stopping metric, as upstream
+optimize_skf_parameters: true
+skf_objective_function: cdf
+num_optimization_trial: 100
+num_startup_trials: 50
+std_transition_error: 1.0e-05
+norm_to_abnorm_prob: 1.0e-05
+abnorm_to_norm_prob: 0.1
+anomaly_detection_threshold: 0.4
+std_transition_error_search_space:
+- 5.0e-06
+- 0.001
+norm_to_abnorm_prob_search_space:
+- 1.0e-05
+- 0.0001
+abnorm_to_norm_prob_search_space:
+- 0.1
+- 0.2
+threshold_search_space:
+- 0.05
+- 0.5
+slope: 0.5
+cdf_num_anomaly: 50
+cdf_anomaly_start: 0.25
+cdf_anomaly_end: 0.75
+objective_detection_rate_cdf_mean: 0.5
+objective_detection_rate_cdf_std: 0.2
+objective_false_rate_cdf_median: 0.1
+objective_false_rate_cdf_shape: 0.2
+objective_anm_mag_cdf_median: 0.2
+objective_anm_mag_cdf_shape: 0.6
+num_anomaly_realizations: 25
+slope_search_space:
+- 0.025
+- 0.05
+- 0.075
+- 0.225
+- 0.5
+evaluation_magnitudes:
+- 0.025
+- 0.05
+- 0.075
+- 0.225
+- 0.5
+- 0.75
+- 1.0
+max_timestep_to_detect: 156
+seeds:
+- 1
+num_workers: null
+# 4 CPUs per case, as in the LLM sweep, so Ray runs the same number of TPE trials
+# side by side (more concurrent trials make TPE propose more of them blind).
+# 10 cases x 4 CPUs with one seed; 11 x 4 with five.
+max_concurrent: 11
+cpus: 44
+ray_object_store_mb: 256
+save_skf_figures: true

@@ -32,6 +32,37 @@ python scripts/benchmark.py
 python scripts/make_figures.py
 ```
 
+### The global-LSTM condition
+
+Upstream's `global_finetune` condition, fine-tuned per series from the global
+model `saved_params/global_model.bin` (1 x 50, lookback 52), on the same series and
+realizations as the LLM sweep. There is no `H`; the cases are (seed, series) and
+land in `<run>/seed<s>/<series>/`. Design and differences:
+[`planning/README.md`](planning/README.md#the-global-lstm-condition-global_finetune).
+
+`results/full_local` is an earlier run of the same pipeline started from the
+256-unit `seed_variability` weights instead (`config/full_local.yaml`). It is kept
+under that name so it is not mistaken for the global model.
+
+`plot_global_vs_llm.ipynb` compares a run with the LLM sweep at one `H`
+(`GLOBAL_RUN`, `LLM_H`).
+
+```bash
+# Assert it sees exactly the LLM sweep's data and realizations
+python scripts/check_same_inputs.py \
+    --llm_run results/full_chronos2_small_zerovar_residual \
+    --config_path config/full_global_finetune.yaml
+
+# The 10 series, 10 cases x 4 CPUs (~35 min)
+python scripts/benchmark.py --config_path config/full_global_finetune.yaml \
+    --output_dir results/full_global_finetune
+```
+
+Each case also checkpoints its trained network (`trained_model.pkl`) before the
+SKF search, which loads it in every trial. Extra `seeds` only change anything with
+one weights file per seed (`{seed}` in `lstm_global_params`); with the single
+`global_model.bin` they would repeat the same run.
+
 **Tuning is checkpointed.** The SKF search is the expensive half (11.6 h of the
 pilot's 17.5 h), so its result is written to `tuned_params.json` before the
 evaluation starts. Re-running against the same output directory reuses it instead
@@ -220,6 +251,20 @@ Each writes to `out/sweep/H{h}/{series}/`, so the shards merge into one tree and
   the machine needs network access or a warm `~/.cache/huggingface`.
 - Requires `chronos-forecasting`, `torch`, `ray`, `optuna`, `fire`, `pyyaml` and
   this repo's `canari` on the path.
+- On Linux with CUDA PyTorch, put its bundled NCCL ahead of the system library
+  before starting Python. Otherwise importing `canari` first in Ray workers can
+  load an older system NCCL and make PyTorch fail with
+  `undefined symbol: ncclCommResume`. From the repository root:
+
+  ```bash
+  conda activate canari
+  nccl_lib=$(python -c 'import sysconfig; print(sysconfig.get_path("purelib") + "/nvidia/nccl/lib")')
+  LD_LIBRARY_PATH="$nccl_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    python -u experiments/llm_anomaly_benchmark/scripts/benchmark.py \
+    --config_path experiments/llm_anomaly_benchmark/config/full_bolt_tiny.yaml \
+    --output_dir experiments/llm_anomaly_benchmark/results/sweep_bolt_tiny
+  ```
+
 - Ray writes trial state to `~/ray_results`; it can grow over a long sweep.
 - Tuning is checkpointed per `(H, series)`, so an interrupted sweep resumes by
   re-running the same `--output_dir`.
@@ -231,8 +276,10 @@ config/benchmark.yaml   every setting, mirroring the upstream config keys
 scripts/common.py       data prep, model construction, Chronos-2 predictor,
                         and upstream's detection rules reimplemented
 scripts/run_series.py   one (series, H): sigma_v grid -> SKF search -> evaluation
-scripts/benchmark.py    sweeps H x series, aggregates, --dry_run cost plan
+scripts/benchmark.py    sweeps H x series (seed x series for the LSTM),
+                        aggregates, --dry_run cost plan
 scripts/make_figures.py figures and LaTeX table from a finished run
+scripts/check_same_inputs.py  asserts the LSTM config sees the LLM sweep's data
 ```
 
 Results land in a timestamped `results/run_*/` with `benchmark_summary.json`, a

@@ -15,11 +15,17 @@ filled by Chronos-2 through the `Auxiliary` component:
 3. **Multi-realization evaluation** -- the same magnitudes, the same up-and-down
    injection, the same three-year detection window, the same metrics.
 
+With `condition: global_finetune` the slot holds upstream's global LSTM instead,
+and stage 1 is upstream's own: at every sigma_v candidate the LSTM is fine-tuned
+from the global weights with early stopping, and the network of the chosen
+candidate is what stages 2 and 3 filter with.
+
     python scripts/run_series.py --series ts67
 """
 
 import json
 import multiprocessing as mp
+import pickle
 import sys
 import time
 from datetime import datetime
@@ -55,23 +61,83 @@ def _score_sigma_v(task):
     return {"sigma_v": float(sigma_v), **metrics}
 
 
+def _train_lstm(task):
+    """Upstream's `_train_lstm`: fine-tune the global LSTM at one sigma_v.
+
+    Each epoch filters the training split (updating the network), forecasts the
+    validation split open loop and scores it; early stopping keeps the network and
+    states of the best epoch. Returns that epoch's validation metrics and the
+    trained model at t=0, pickled here: unpickling it in the pool's result thread
+    would import canari off the main thread, which canari's signal setup forbids.
+    """
+
+    series, config, sigma_v = task
+    metric_key, mode = METRIC_KEYS[str(config["early_stopping_metric"]).lower()]
+    dataset = common.prepare_dataset(series, config)
+    model = common.build_lstm_model(sigma_v, dataset, config)
+    observations = dataset["data_processor"].get_data("validation").flatten()
+
+    history = []
+    num_epoch = int(config["lstm_num_epoch"])
+    for epoch in range(num_epoch):
+        common.set_lstm_warmup(model, dataset)
+        mu, std, _ = model.lstm_train(
+            train_data=dataset["train_data"],
+            validation_data=dataset["validation_data"],
+            white_noise_decay=False,
+        )
+        metrics = common.validation_metrics(mu, std, observations, dataset["data_processor"])
+        history.append(metrics)
+        model.early_stopping(
+            evaluate_metric=metrics[metric_key],
+            current_epoch=epoch,
+            max_epoch=num_epoch,
+            mode=mode,
+            skip_epoch=0,
+        )
+        if model.stop_training:
+            break
+
+    best = int(model.optimal_epoch)
+    return {
+        "sigma_v": float(sigma_v),
+        **history[best],
+        "optimal_epoch": best,
+        "num_epochs": len(history),
+        "trained_model": pickle.dumps(model.get_dict(time_step=0)),
+    }
+
+
+def _pool(workers, config):
+    """Spawn pool whose workers preload the foundation model, if there is one."""
+
+    if common.uses_lstm(config):
+        return mp.get_context("spawn").Pool(workers)
+    return mp.get_context("spawn").Pool(
+        workers, initializer=common.init_worker, initargs=(config.get("model_id"),)
+    )
+
+
 def search_sigma_v(series, config):
+    """Pick sigma_v; also returns the chosen candidate's trained model (LSTM only, pickled)."""
+
     metric_key, mode = METRIC_KEYS[str(config["early_stopping_metric"]).lower()]
     candidates = list(config["sigma_v_search_space"])
     print(f"---- sigma_v grid search over {candidates} (metric: {metric_key}) ----")
 
+    score = _train_lstm if common.uses_lstm(config) else _score_sigma_v
     tasks = [(series, config, sv) for sv in candidates]
     workers = max(1, min(int(config["num_workers"]), len(tasks)))
     if workers > 1:
-        with mp.get_context("spawn").Pool(
-            workers, initializer=common.init_worker, initargs=(config.get("model_id"),)
-        ) as pool:
-            results = pool.map(_score_sigma_v, tasks)
+        with _pool(workers, config) as pool:
+            results = pool.map(score, tasks)
     else:
-        results = [_score_sigma_v(task) for task in tasks]
+        results = [score(task) for task in tasks]
+    trained = [row.pop("trained_model", None) for row in results]
 
     for row in results:
-        print(f"  sigma_v={row['sigma_v']:.4f} -> {metric_key}={row[metric_key]:.6f}")
+        epochs = f" (epoch {row['optimal_epoch']} of {row['num_epochs']})" if "num_epochs" in row else ""
+        print(f"  sigma_v={row['sigma_v']:.4f} -> {metric_key}={row[metric_key]:.6f}{epochs}")
 
     scores = [row[metric_key] for row in results]
     best = max(scores) if mode == "max" else min(scores)
@@ -84,7 +150,7 @@ def search_sigma_v(series, config):
     chosen = min(tolerated, key=lambda row: row["sigma_v"])
     print(f"---- Optimal sigma_v: {chosen['sigma_v']:.4f} "
           f"({metric_key}={chosen[metric_key]:.6f}) ----")
-    return chosen, results
+    return chosen, results, trained[results.index(chosen)]
 
 
 # ---- Stage 2: SKF parameter search ---------------------------------------------
@@ -95,9 +161,10 @@ def _skf_from_param(param, model_input):
     config = model_input["config"]
     resolved = {**model_input["default_param"], **param}
 
-    common.set_model_id(config.get("model_id"))
     dataset = common.prepare_dataset(series, config)
-    skf, auxiliary = common.build_skf(common.predict_fn(), resolved, dataset, config)
+    skf, auxiliary = common.build_skf(
+        common.recurrent_predictor(config), resolved, dataset, config
+    )
 
     if str(config["skf_objective_function"]).lower() == "cdf":
         magnitude = float(resolved["slope"])
@@ -120,17 +187,24 @@ def _skf_from_param(param, model_input):
             dataset["data_processor"], dataset["data_processor"].validation_end
         )
         false_rate = num_false_alarms / years
-        skf.metric_optim = skf.objective(
-            detection_rate,
-            false_rate,
-            magnitude,
-            detection_rate_cdf_mean=float(config["objective_detection_rate_cdf_mean"]),
-            detection_rate_cdf_std=float(config["objective_detection_rate_cdf_std"]),
-            false_rate_cdf_median=float(config["objective_false_rate_cdf_median"]),
-            false_rate_cdf_shape=float(config["objective_false_rate_cdf_shape"]),
-            anm_mag_cdf_median=float(config["objective_anm_mag_cdf_median"]),
-            anm_mag_cdf_shape=float(config["objective_anm_mag_cdf_shape"]),
-        )
+        # Departs from upstream: `j1 = norm.cdf(0, 0.5, 0.2)` is 0.0062, not 0, so a
+        # trial that detects nothing at the smallest slope outscores one that
+        # detects everything at 1.0/yr, and the search settles on an inert detector.
+        # A trial with no detections therefore scores 0.
+        if detection_rate == 0:
+            skf.metric_optim = 0.0
+        else:
+            skf.metric_optim = skf.objective(
+                detection_rate,
+                false_rate,
+                magnitude,
+                detection_rate_cdf_mean=float(config["objective_detection_rate_cdf_mean"]),
+                detection_rate_cdf_std=float(config["objective_detection_rate_cdf_std"]),
+                false_rate_cdf_median=float(config["objective_false_rate_cdf_median"]),
+                false_rate_cdf_shape=float(config["objective_false_rate_cdf_shape"]),
+                anm_mag_cdf_median=float(config["objective_anm_mag_cdf_median"]),
+                anm_mag_cdf_shape=float(config["objective_anm_mag_cdf_shape"]),
+            )
         skf.print_metric = {
             "detection_rate": detection_rate,
             "yearly_false_rate": false_rate,
@@ -161,6 +235,12 @@ def search_skf_parameters(series, config, default_param):
         # its object store -- which, multiplied by the number of concurrent cases,
         # is enough to exhaust the server. Trials here exchange small dicts, so a
         # small store is ample.
+        # pytagi's `cutagi` links the system libnccl.so.2 (2.18), which lacks
+        # symbols torch needs. Workers unpickle canari before torch, so the old
+        # NCCL gets loaded first and `import torch` fails; preload torch's copy.
+        import nvidia.nccl
+
+        nccl = Path(nvidia.nccl.__path__[0]) / "lib" / "libnccl.so.2"
         ray.init(
             num_cpus=budget,
             object_store_memory=int(config.get("ray_object_store_mb", 256)) * 1024**2,
@@ -168,6 +248,7 @@ def search_skf_parameters(series, config, default_param):
             log_to_driver=False,
             ignore_reinit_error=True,
             configure_logging=False,
+            runtime_env={"env_vars": {"LD_PRELOAD": str(nccl)}},
         )
 
     space = {
@@ -204,8 +285,7 @@ def search_skf_parameters(series, config, default_param):
 def _evaluate_magnitude(task):
     """Detection rate, false alarms and time to detection at one magnitude."""
 
-    series, config, param, magnitude = task
-    common.set_model_id(config.get("model_id"))
+    series, config, param, magnitude, figure_dir = task
     dataset = common.prepare_dataset(series, config)
     processor = dataset["data_processor"]
     total_steps = len(dataset["all_data"]["y"])
@@ -219,7 +299,7 @@ def _evaluate_magnitude(task):
         anomaly_start,
         anomaly_end,
     )
-    skf, auxiliary = common.build_skf(common.predict_fn(), param, dataset, config)
+    skf, auxiliary = common.build_skf(common.recurrent_predictor(config), param, dataset, config)
     detection_rate, num_false_alarms, (ttd_mean, ttd_std) = common.detect_synthetic_anomaly(
         skf,
         auxiliary,
@@ -228,6 +308,19 @@ def _evaluate_magnitude(task):
         threshold=float(param["threshold"]),
         max_timestep_to_detect=config["max_timestep_to_detect"],
     )
+    if figure_dir is not None:
+        # One realization drawn at random (reproducibly) per magnitude.
+        if common.uses_lstm(config):
+            case, key = f"seed{int(config['seed'])}", [int(config["seed"])]
+        else:
+            case = f"H{int(config['llm_horizon'])}"
+            key = [int(config["seeds"][0]), int(config["llm_horizon"])]
+        rng = np.random.default_rng([*key, round(magnitude * 1000)])
+        index = int(rng.integers(len(realizations)))
+        common.save_skf_figure(
+            skf, auxiliary, dataset, realizations[index], float(param["threshold"]),
+            figure_dir / f"{case}_mag{magnitude:g}_r{index}.pdf",
+        )
     years = common.years_spanned(processor, processor.test_end)
     return {
         "anomaly_magnitude": float(magnitude),
@@ -240,9 +333,9 @@ def _evaluate_magnitude(task):
     }
 
 
-def evaluate_magnitudes(series, config, param, partial_path=None):
-    magnitudes = list(config["slope_search_space"])
-    tasks = [(series, config, param, mag) for mag in magnitudes]
+def evaluate_magnitudes(series, config, param, partial_path=None, figure_dir=None):
+    magnitudes = list(common.evaluation_magnitudes(config))
+    tasks = [(series, config, param, mag, figure_dir) for mag in magnitudes]
     workers = max(1, min(int(config["num_workers"]), len(tasks)))
 
     def record(row):
@@ -288,6 +381,13 @@ def run(series, config, output_dir, resume=True):
     started = time.time()
     output_dir.mkdir(parents=True, exist_ok=True)
     tuning_path = output_dir / "tuned_params.json"
+    lstm = common.uses_lstm(config)
+    if lstm:
+        # The trained network is what the SKF search and the evaluation filter
+        # with; their worker processes load it from here. Absolute, because Ray
+        # Tune runs each trial from its own directory under ~/ray_results.
+        trained_path = output_dir / "trained_model.pkl"
+        config = {**config, "trained_model_path": str(trained_path.resolve())}
 
     if resume and tuning_path.exists():
         saved = json.loads(tuning_path.read_text())
@@ -296,12 +396,17 @@ def run(series, config, output_dir, resume=True):
         sigma_v_grid = saved.get("sigma_v_grid_search")
         print(f"Resuming: reusing tuned parameters from {tuning_path}")
     else:
-        sigma_v_result, sigma_v_grid = None, None
+        sigma_v_result, sigma_v_grid, trained = None, None, None
         if config.get("optimize_sigma_v", False):
-            sigma_v_result, sigma_v_grid = search_sigma_v(series, config)
+            sigma_v_result, sigma_v_grid, trained = search_sigma_v(series, config)
             sigma_v = sigma_v_result["sigma_v"]
         else:
             sigma_v = float(config["sigma_v"])
+            if lstm:
+                sigma_v_result = _train_lstm((series, config, sigma_v))
+                trained = sigma_v_result.pop("trained_model")
+        if lstm:
+            trained_path.write_bytes(trained)
 
         default_param = {
             "sigma_v": sigma_v,
@@ -329,15 +434,26 @@ def run(series, config, output_dir, resume=True):
         )
     print("Model parameters used:", param)
 
+    # output_dir is <run>/H<h>/<series> (<run>/seed<s>/<series> for the LSTM);
+    # figures go to figures/<run>/<series>/.
+    figure_dir = (
+        common.EXP_DIR / "figures" / output_dir.parents[1].name / series
+        if config.get("save_skf_figures") else None
+    )
     results = evaluate_magnitudes(
-        series, config, param, partial_path=output_dir / "evaluation.partial.json"
+        series, config, param, partial_path=output_dir / "evaluation.partial.json",
+        figure_dir=figure_dir,
     )
 
     summary = {
         "series": series,
         "created": datetime.now().isoformat(timespec="seconds"),
         "elapsed_seconds": round(time.time() - started, 1),
-        "llm_horizon": int(config["llm_horizon"]),
+        **(
+            {"condition": config["condition"], "seed": int(config["seed"])}
+            if lstm
+            else {"llm_horizon": int(config["llm_horizon"])}
+        ),
         "model_parameters_used": param,
         "optimal_validation_metrics": sigma_v_result,
         "sigma_v_grid_search": sigma_v_grid,
@@ -350,6 +466,8 @@ def run(series, config, output_dir, resume=True):
 
 def main(series=None, config_path=None, output_dir=None):
     config = common.load_config(config_path)
+    if common.uses_lstm(config):
+        config.setdefault("seed", int(config["seeds"][0]))
     series = series or common.resolve_series(config)[0]
     output_dir = Path(output_dir) if output_dir else (
         common.EXP_DIR / "results" / datetime.now().strftime("run_%Y%m%d_%H%M%S") / series

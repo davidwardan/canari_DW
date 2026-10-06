@@ -1,27 +1,14 @@
-# Full sweep: 10 series x 8 horizons = 80 cases, Chronos-Bolt-tiny.
+# Full sweep with Chronos-2: identical to full_bolt_tiny.yaml except `model_id`
+# (and `experiment_name`), so the two sweeps compare the foundation model alone.
 #
-#   python scripts/benchmark.py --config_path config/full_bolt_tiny.yaml
+#   python scripts/benchmark.py --config_path config/full_chronos2.yaml
 #
-# Sizing for a 48-core server, leaving 4 cores free:
-#   cpus: 44            cores the driver may use (48 - 4)
-#   max_concurrent: 11  cases side by side, 4 CPUs each
-#
-# 11 rather than the 22 that pure speed would pick: wall clock is nearly flat
-# across that range (15.4 h at 22, 15.9 h at 11) but each concurrent case runs its
-# own local Ray instance, so halving the count cuts peak RAM from roughly 29 GB to
-# 22 GB and halves the number of Ray clusters on the box. Ray's object store is
-# also pinned to 256 MB per instance; its default is ~30% of system RAM, which
-# multiplied by 11 would exhaust the server.
-#
-# Estimated 571 core-hours -> ~16 h wall. `--dry_run True` reprints this for any
-# edit. Tuning checkpoints per (H, series), so an interrupted run resumes on the
-# same --output_dir.
-#
-# cdf_num_anomaly stays at upstream's 50: the SKF search is ~80% of the cost and
-# dropping it to 10 would cut the run to ~4 h, but it is left at full fidelity
-# since 16 h is an overnight job.
+# Same sizing as the bolt-tiny sweep (44 of 48 cores, 11 cases x 4 CPUs).
+# `--dry_run True` over H=[3..208] estimates 3627 core-hours -> ~97 h wall, from
+# 277.7 ms per Chronos-2 call (vs 10.5 ms for bolt-tiny). The SKF search is ~95% of
+# it; `cdf_num_anomaly` is the knob to reach for if that is too long.
 
-experiment_name: llm_anomaly_benchmark_full_bolt_tiny
+experiment_name: llm_anomaly_benchmark_full_chronos2
 values_file: data/hq_benchmark_data/weekly/weekly_values.csv
 datetimes_file: data/hq_benchmark_data/weekly/weekly_datetimes.csv
 series: null
@@ -29,7 +16,7 @@ global_warmup_lookback_len: 52
 baseline_init_len: 52
 validation_ratio: 0.15
 test_ratio: 0.5
-model_id: amazon/chronos-bolt-tiny
+model_id: amazon/chronos-2
 llm_horizon: 1
 llm_horizon_search_space:
 - 1

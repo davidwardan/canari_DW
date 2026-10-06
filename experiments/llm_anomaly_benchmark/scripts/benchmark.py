@@ -7,6 +7,10 @@ initialization is a real source of spread; Chronos-2 is deterministic, so the
 default is a single seed and the per-magnitude spread reported here is across
 series rather than across seeds.
 
+A config with `condition: global_finetune` runs upstream's global LSTM condition
+on the same series and realizations instead. It has no horizon; its cases are
+(seed, series), since upstream keeps one set of global weights per seed.
+
     python scripts/benchmark.py --dry_run True     # planned work and cost, runs nothing
     python scripts/benchmark.py                    # the full benchmark
     python scripts/benchmark.py --series '["ts67","ts26"]'
@@ -39,8 +43,19 @@ SECONDS_PER_CALL_BY_MODEL = {
     "amazon/chronos-bolt-tiny": 0.0105,
     "amazon/chronos-bolt-base": 0.1479,
     "amazon/chronos-2": 0.2777,
+    # 54 vs 206 ms for chronos-2 on the Linux server, scaled to the M2 figure above
+    "autogluon/chronos-2-small": 0.0728,
 }
 SECONDS_PER_SKF_STEP = 0.0016
+
+# Global LSTM (1 x 256, lookback 52), single process on the 48-core Linux server,
+# measured on ts58: one training step (filter with weight update, or the
+# validation forecast) and one SKF step including the LSTM forward pass.
+SECONDS_PER_LSTM_TRAIN_STEP = 0.0056
+SECONDS_PER_LSTM_SKF_STEP = 0.0014
+# Early stopping has patience 20, so a candidate trains for at least 21 epochs;
+# ts58 stopped at exactly 21 at both sigma_v timed. A planning figure, not a bound.
+PLANNED_LSTM_EPOCHS = 21
 
 
 def seconds_per_call(config):
@@ -57,6 +72,8 @@ def horizons(config):
 def plan(config, series_names):
     """Count the filter runs the benchmark will perform, and their cost."""
 
+    if common.uses_lstm(config):
+        return _plan_lstm(config, series_names)
     per_call = seconds_per_call(config)
     rows = []
     for horizon in horizons(config):
@@ -64,8 +81,59 @@ def plan(config, series_names):
     return rows
 
 
+def _plan_lstm(config, series_names):
+    """The global-LSTM counterpart of `_plan_one_horizon`, one set of rows per seed.
+
+    Training takes the place of the sigma_v scoring pass: every candidate filters
+    the training split and forecasts the validation split once per epoch. The
+    LSTM forward pass is part of the SKF step cost, so no Chronos calls appear.
+    """
+
+    num_magnitudes = len(common.evaluation_magnitudes(config))
+    realizations = 2 * int(config["num_anomaly_realizations"])  # up and down
+    rows = []
+    for series in series_names:
+        dataset = common.prepare_dataset(series, config)
+        train_val_steps = len(dataset["train_val"]["y"])
+        all_steps = len(dataset["all_data"]["y"])
+        if str(config["skf_objective_function"]).lower() == "cdf":
+            filters_per_trial, search_steps = 1 + 2 * int(config["cdf_num_anomaly"]), train_val_steps
+        else:
+            filters_per_trial, search_steps = 1, all_steps
+        candidates = len(config["sigma_v_search_space"]) if config["optimize_sigma_v"] else 1
+
+        stages = {
+            "LSTM training": (candidates * PLANNED_LSTM_EPOCHS, train_val_steps,
+                              SECONDS_PER_LSTM_TRAIN_STEP),
+            "SKF search": (
+                int(config["num_optimization_trial"]) * filters_per_trial
+                if config["optimize_skf_parameters"]
+                else 0,
+                search_steps,
+                SECONDS_PER_LSTM_SKF_STEP,
+            ),
+            "evaluation": (num_magnitudes * (1 + realizations), all_steps,
+                           SECONDS_PER_LSTM_SKF_STEP),
+        }
+        for seed in config["seeds"]:
+            for stage, (num_filters, steps, per_step) in stages.items():
+                rows.append(
+                    {
+                        "series": series,
+                        "horizon": 1,
+                        "seed": int(seed),
+                        "stage": stage,
+                        "filters": num_filters,
+                        "steps_each": steps,
+                        "chronos_calls": 0,
+                        "seconds": num_filters * steps * per_step,
+                    }
+                )
+    return rows
+
+
 def _plan_one_horizon(config, series_names, horizon, per_call):
-    num_magnitudes = len(config["slope_search_space"])
+    num_magnitudes = len(common.evaluation_magnitudes(config))
     realizations = 2 * int(config["num_anomaly_realizations"])  # up and down
     rows = []
 
@@ -160,9 +228,12 @@ def print_plan(rows, config, cpus=None):
         entry["chronos_calls"] += row["chronos_calls"]
         entry["seconds"] += row["seconds"]
 
-    print(f"\nPlanned work over H={horizons(config)}, "
+    lstm = common.uses_lstm(config)
+    sweep = f"seeds={config['seeds']}" if lstm else f"H={horizons(config)}"
+    model = config["condition"] if lstm else config.get("model_id")
+    print(f"\nPlanned work over {sweep}, "
           f"objective={config['skf_objective_function']}, "
-          f"model={config.get('model_id')}, "
+          f"model={model}, "
           f"{len({r['series'] for r in rows})} series\n")
     print(f"{'stage':<16}{'filters':>10}{'Chronos calls':>16}{'core-hours':>12}")
     print("-" * 52)
@@ -175,15 +246,23 @@ def print_plan(rows, config, cpus=None):
     print(f"{'TOTAL':<16}{sum(e['filters'] for e in by_stage.values()):>10,}"
           f"{sum(e['chronos_calls'] for e in by_stage.values()):>16,}"
           f"{total_seconds / 3600:>12.1f}")
-    print(
-        "\nCore-hours, from single-process latency "
-        f"({seconds_per_call(config) * 1000:.1f} ms per call for "
-        f"{config.get('model_id')}, {SECONDS_PER_SKF_STEP * 1000:.1f} ms per SKF "
-        "step, measured on an Apple M2)."
-    )
-    print(
-        "Cost scales as 1/llm_horizon for the Chronos calls; the SKF term does not."
-    )
+    if lstm:
+        print(
+            "\nCore-hours, from single-process cost measured on the Linux server "
+            f"({SECONDS_PER_LSTM_TRAIN_STEP * 1000:.1f} ms per training step, "
+            f"{SECONDS_PER_LSTM_SKF_STEP * 1000:.1f} ms per SKF step, "
+            f"{PLANNED_LSTM_EPOCHS} epochs per sigma_v candidate)."
+        )
+    else:
+        print(
+            "\nCore-hours, from single-process latency "
+            f"({seconds_per_call(config) * 1000:.1f} ms per call for "
+            f"{config.get('model_id')}, {SECONDS_PER_SKF_STEP * 1000:.1f} ms per SKF "
+            "step, measured on an Apple M2)."
+        )
+        print(
+            "Cost scales as 1/llm_horizon for the Chronos calls; the SKF term does not."
+        )
     if str(config["skf_objective_function"]).lower() == "cdf":
         print(
             f"The cdf objective filters {1 + 2 * int(config['cdf_num_anomaly'])} "
@@ -192,7 +271,7 @@ def print_plan(rows, config, cpus=None):
         )
     print(
         "Cheapest knobs: cdf_num_anomaly, num_optimization_trial, "
-        "num_anomaly_realizations, slope_search_space, llm_horizon."
+        f"num_anomaly_realizations, slope_search_space{'' if lstm else ', llm_horizon'}."
     )
 
     print(f"\n{'cores':>7}{'parallel cases':>16}{'cpus/case':>11}"
@@ -204,17 +283,20 @@ def print_plan(rows, config, cpus=None):
         marker = "  <- configured" if candidate == planned else ""
         print(f"{est['cpus']:>7}{est['concurrent']:>16}{est['budget']:>11}"
               f"{est['longest_case_h']:>13.1f}h{est['wall_h']:>12.1f}h{marker}")
-    print(f"\nCases are independent, so this parallelizes at the (H, series) level; "
+    print(f"\nCases are independent, so this parallelizes at the "
+          f"({'seed' if lstm else 'H'}, series) level; "
           f"{estimate_wall_clock(rows, config, cpus)['num_cases']} cases, "
           f"{estimate_wall_clock(rows, config, cpus)['serial_h']:.0f} core-hours total.")
 
 
 def _run_case(args):
-    """One (H, series) case in its own process, with its own CPU budget."""
+    """One (H, series) or (seed, series) case in its own process, with its own CPU budget."""
 
-    series, horizon, config, run_dir = args
-    case_config = {**config, "llm_horizon": horizon}
-    return run_series.run(series, case_config, Path(run_dir) / f"H{horizon}" / series)
+    series, case, config, run_dir = args
+    if common.uses_lstm(config):
+        return run_series.run(series, {**config, "seed": case}, Path(run_dir) / f"seed{case}" / series)
+    case_config = {**config, "llm_horizon": case}
+    return run_series.run(series, case_config, Path(run_dir) / f"H{case}" / series)
 
 
 SPEEDUP_EFFICIENCY = 0.8  # extra cores help the Chronos calls, not the SKF bookkeeping
@@ -223,7 +305,7 @@ SPEEDUP_EFFICIENCY = 0.8  # extra cores help the Chronos calls, not the SKF book
 def _case_seconds(rows):
     seconds = defaultdict(float)
     for row in rows:
-        seconds[(row["horizon"], row["series"])] += row["seconds"]
+        seconds[(row["horizon"], row.get("seed"), row["series"])] += row["seconds"]
     return sorted(seconds.values(), reverse=True)
 
 
@@ -250,7 +332,7 @@ def useful_budget(config):
     return max(
         int(config.get("num_optimization_trial", 50)) if config.get("optimize_skf_parameters") else 1,
         len(config.get("sigma_v_search_space", [])) if config.get("optimize_sigma_v") else 1,
-        len(config.get("slope_search_space", [])),
+        len(common.evaluation_magnitudes(config)),
     )
 
 
@@ -300,22 +382,28 @@ def estimate_wall_clock(rows, config, cpus=None):
 
 
 def aggregate(summaries):
-    """Mean and spread of each metric per magnitude, across series."""
+    """Mean and spread of each metric per magnitude, across series (and seeds).
+
+    The LSTM has no horizon, so its `llm_horizon` is None; with several seeds the
+    spread is over every (seed, series) run.
+    """
 
     groups = defaultdict(list)
     for summary in summaries:
         for row in summary["multi_realization_evaluation"]:
-            groups[(summary["llm_horizon"], row["anomaly_magnitude"])].append(row)
+            key = (summary.get("condition", "llm"), summary.get("llm_horizon"),
+                   row["anomaly_magnitude"])
+            groups[key].append({**row, "series": summary["series"], "seed": summary.get("seed")})
 
     aggregates = []
-    for (horizon, magnitude), items in sorted(groups.items()):
+    for (condition, horizon, magnitude), items in sorted(groups.items()):
         def stat(key, reducer):
             values = [r[key] for r in items if r[key] is not None and np.isfinite(r[key])]
             return float(reducer(values)) if values else None
 
         aggregates.append(
             {
-                "condition": "llm",
+                "condition": condition,
                 "llm_horizon": horizon,
                 "anomaly_magnitude": magnitude,
                 "probability_of_detection": stat("probability_of_detection", np.mean),
@@ -325,7 +413,8 @@ def aggregate(summaries):
                 "time_to_detection_years_mean": stat("time_to_detection_years_mean", np.mean),
                 "time_to_detection_years_std": stat("time_to_detection_years_mean", np.std),
                 "total_realizations": sum(r["num_realizations"] for r in items),
-                "num_series": len(items),
+                "num_series": len({r["series"] for r in items}),
+                "num_seeds": len({r["seed"] for r in items}),
             }
         )
     return aggregates
@@ -340,8 +429,9 @@ def print_aggregates(aggregates):
     print("-" * len(header))
     for row in aggregates:
         fmt = lambda v, d=3: "N/A" if v is None else f"{v:.{d}f}"
+        horizon = "-" if row["llm_horizon"] is None else row["llm_horizon"]
         print(
-            f"{row['llm_horizon']:>6}"
+            f"{horizon:>6}"
             f"{row['anomaly_magnitude']:>10.3f}"
             f"{fmt(row['probability_of_detection'], 2):>12}"
             f"{fmt(row['probability_of_detection_std']):>12}"
@@ -382,45 +472,48 @@ def main(config_path=None, series=None, dry_run=False, output_dir=None,
 
     started = time.time()
     summaries = []
-    sweep = horizons(config)
-    cases = [(h, s) for h in sweep for s in series_names]
+    lstm = common.uses_lstm(config)
+    sweep = [int(s) for s in config["seeds"]] if lstm else horizons(config)
+    label = "seed" if lstm else "H"
+    cases = [(c, s) for c in sweep for s in series_names]
     concurrent, budget = choose_parallelism(plan(config, series_names), config)
     usable = config.get("cpus") or os.cpu_count()
-    print(f"{len(cases)} cases ({len(sweep)} horizons x {len(series_names)} series), "
+    print(f"{len(cases)} cases ({len(sweep)} {'seeds' if lstm else 'horizons'} x "
+          f"{len(series_names)} series), "
           f"up to {concurrent} in parallel, {budget} CPU(s) each, "
           f"using {usable} of {os.cpu_count()} cores.")
 
     if concurrent == 1:
-        for index, (horizon, name) in enumerate(cases, 1):
-            print(f"\n{'=' * 70}\n[{index}/{len(cases)}] {name}  H={horizon}\n"
+        for index, (case, name) in enumerate(cases, 1):
+            print(f"\n{'=' * 70}\n[{index}/{len(cases)}] {name}  {label}={case}\n"
                   f"{'=' * 70}", flush=True)
             try:
-                summaries.append(_run_case((name, horizon, config, run_dir)))
+                summaries.append(_run_case((name, case, config, run_dir)))
             except Exception as exc:  # one bad case must not lose the rest
-                print(f"FAILED {name} H={horizon}: {type(exc).__name__}: {exc}",
+                print(f"FAILED {name} {label}={case}: {type(exc).__name__}: {exc}",
                       flush=True)
     else:
         case_config = {**config, "num_workers": budget}
-        payload = [(name, horizon, case_config, str(run_dir)) for horizon, name in cases]
+        payload = [(name, case, case_config, str(run_dir)) for case, name in cases]
         with ProcessPoolExecutor(
             max_workers=concurrent, mp_context=get_context("spawn")
         ) as executor:
             futures = {executor.submit(_run_case, item): item for item in payload}
             for done, future in enumerate(as_completed(futures), 1):
-                name, horizon, *_ = futures[future]
+                name, case, *_ = futures[future]
                 try:
                     summaries.append(future.result())
-                    print(f"[{done}/{len(cases)}] done {name} H={horizon}", flush=True)
+                    print(f"[{done}/{len(cases)}] done {name} {label}={case}", flush=True)
                 except Exception as exc:
-                    print(f"[{done}/{len(cases)}] FAILED {name} H={horizon}: "
+                    print(f"[{done}/{len(cases)}] FAILED {name} {label}={case}: "
                           f"{type(exc).__name__}: {exc}", flush=True)
 
     aggregates = aggregate(summaries)
     (run_dir / "benchmark_summary.json").write_text(
         json.dumps(
             {
-                "condition": "llm",
-                "llm_horizon_search_space": sweep,
+                "condition": config.get("condition", "llm"),
+                ("seeds" if lstm else "llm_horizon_search_space"): sweep,
                 "series": series_names,
                 "completed": [s["series"] for s in summaries],
                 "aggregate_by_magnitude": aggregates,

@@ -1,27 +1,16 @@
-# Full sweep: 10 series x 8 horizons = 80 cases, Chronos-Bolt-tiny.
+# pilot_2series_chronos2_small_zerovar_residual.yaml on all 10 series, without
+# H=1. Chronos-2 small with its predictive variance set to zero, and the context
+# fed back as c_post + w_post (= y - level_post).
+# H=1 is dropped: in the 2-series pilot the filter diverged at H=1 for some large
+# (magnitude 1.0) realizations -- Chronos extrapolates the residual, the level
+# compensates, and the fed-back residual grows without bound.
 #
-#   python scripts/benchmark.py --config_path config/full_bolt_tiny.yaml
+# save_skf_figures: one random realization per (series, H, magnitude) is plotted
+# to figures/<run dir name>/<series>/H<h>_mag<m>_r<index>.pdf.
 #
-# Sizing for a 48-core server, leaving 4 cores free:
-#   cpus: 44            cores the driver may use (48 - 4)
-#   max_concurrent: 11  cases side by side, 4 CPUs each
+#   python scripts/benchmark.py --config_path config/full_chronos2_small_zerovar_residual.yaml
 #
-# 11 rather than the 22 that pure speed would pick: wall clock is nearly flat
-# across that range (15.4 h at 22, 15.9 h at 11) but each concurrent case runs its
-# own local Ray instance, so halving the count cuts peak RAM from roughly 29 GB to
-# 22 GB and halves the number of Ray clusters on the box. Ray's object store is
-# also pinned to 256 MB per instance; its default is ~30% of system RAM, which
-# multiplied by 11 would exhaust the server.
-#
-# Estimated 571 core-hours -> ~16 h wall. `--dry_run True` reprints this for any
-# edit. Tuning checkpoints per (H, series), so an interrupted run resumes on the
-# same --output_dir.
-#
-# cdf_num_anomaly stays at upstream's 50: the SKF search is ~80% of the cost and
-# dropping it to 10 would cut the run to ~4 h, but it is left at full fidelity
-# since 16 h is an overnight job.
-
-experiment_name: llm_anomaly_benchmark_full_bolt_tiny
+experiment_name: llm_anomaly_benchmark_full_chronos2_small_zerovar_residual
 values_file: data/hq_benchmark_data/weekly/weekly_values.csv
 datetimes_file: data/hq_benchmark_data/weekly/weekly_datetimes.csv
 series: null
@@ -29,10 +18,9 @@ global_warmup_lookback_len: 52
 baseline_init_len: 52
 validation_ratio: 0.15
 test_ratio: 0.5
-model_id: amazon/chronos-bolt-tiny
+model_id: autogluon/chronos-2-small
 llm_horizon: 1
 llm_horizon_search_space:
-- 1
 - 3
 - 6
 - 13
@@ -107,3 +95,6 @@ num_workers: null
 max_concurrent: 11
 cpus: 44
 ray_object_store_mb: 256
+zero_llm_variance: true
+feed_observed_residual: true
+save_skf_figures: true
