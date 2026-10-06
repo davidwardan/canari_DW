@@ -49,6 +49,26 @@ def test_rsr_filter_updates_parameters(strategy):
     assert parameters_changed(parameters_before, model.lstm_net.state_dict())
 
 
+@pytest.mark.parametrize("strategy", STRATEGIES)
+def test_rsr_filter_handles_missing_observation(strategy):
+    # The missing step is replayed by every later window of the run.
+    data = make_data()
+    data["y"][9] = np.nan
+    model = make_lstm_model()
+
+    mean, std, _ = model.rsr_filter(
+        data, start=10, end=13, window_len=3, strategy=strategy
+    )
+
+    assert np.all(np.isfinite(mean))
+    assert np.all(np.isfinite(std))
+    assert all(
+        np.all(np.isfinite(np.asarray(values)))
+        for layer in model.lstm_net.state_dict().values()
+        for values in layer
+    )
+
+
 def test_rsr_filter_rejects_unknown_strategy():
     with pytest.raises(ValueError, match="Incorrect strategy"):
         make_lstm_model().rsr_filter(

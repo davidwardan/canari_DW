@@ -160,6 +160,9 @@ def _cached_update(model, x, y, mu_baseline: float, var_baseline: float) -> None
     var_obs = var_lstm + var_baseline
     delta_mu = (float(np.asarray(y).item()) - mu_baseline - mu_lstm) / var_obs
     delta_var = -1 / var_obs
+    if np.isnan(delta_mu):
+        # A missing observation carries no information, as in `Model.filter`.
+        delta_mu, delta_var = 0.0, 0.0
     model.lstm_net.update_param(np.float32([delta_mu]), np.float32(delta_var))
     model.lstm_output_history.update(
         np.float32(mu_lstm + var_lstm * delta_mu),
