@@ -98,6 +98,7 @@ mpl.rcParams.update({
 * Prefer direct comparison within one figure only when curves remain easy to distinguish; otherwise use separate figures.
 * Ensure text, ticks, and legends remain readable at the final printed figure size.
 * Save every final figure as both `.pgf` and `.pdf`.
+* When plotting predictions with uncertainty, always plot \pm 1 standard deviation.
 
 For time-series plots:
 
@@ -127,6 +128,7 @@ Use the project Matplotlib defaults and save figures under the experiment's `fig
   * dataset and train/validation/test split;
   * baselines and metrics;
   * expected outcome.
+  * for latex math, use $ ...$ for inline and $$ ... $$ for display math.
 
 * Keep experiment-specific code outside `src/`. Modify `src/` only when necessary and document why.
 
