@@ -92,6 +92,28 @@ Figures use seed 1; arm comparisons use `rsr_replay_filtered`.
    smaller LSTM drift than the unconstrained arm.
 3. Benchmark with the same code and settings; tables and figures from saved results.
 
+## Runs
+
+- `results/20261027-162620_penalty_spectrum`: equivalent-std table and spectrum.
+- `results/20261027-162643_toy`: toy, three arms, seeds 1--5.
+- `results/20261027-163139_benchmark`: aborted, see its `ABORTED.md`.
+- `results/20261027-164053_benchmark`: benchmark, three arms, seeds 1--5. Tables in
+  `summary_median_iqr.md` and `per_series_mean_std_over_seeds.md`; figure index in
+  `figures.md`.
+
+Protocol change after the aborted batch: a diverged LSTM makes CANARI's constrained
+forward raise a `ValueError` for nonfinite moments. It now falls under the same
+numerical-failure policy as `LinAlgError` and `FloatingPointError` (retain the best
+valid epoch or exclude the candidate). Each run's `selection.json` lists such
+candidates; in the benchmark all were at $\sigma_V=0.01$ and none was selected.
+
+Observed, not yet explained: with `rsr_replay_smoothed` the auxiliary-SSM arm reduces
+the LSTM drift much less than with `rsr_replay_filtered`, consistently across
+series, while the EWMA arm does not show this gap. Hypotheses to test: the window
+restart from the smoothed boundary of the coupled level/slope memories, or poor
+conditioning of the RTS gain, because the slope memory is about $10^{-4}$ times the
+scale of the other states.
+
 ## Reproduce
 
 Run from the repository root. `PYTHONPATH` must point at this branch's `src`.
