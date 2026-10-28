@@ -157,4 +157,10 @@ SRC=/Users/davidwardan/canari_DW/src
 PYTHONPATH=$SRC /opt/miniconda3/envs/canari/bin/python -m pytest experiments/ewma_drift_attribution/scripts/test_experiment.py -q
 PYTHONPATH=$SRC /opt/miniconda3/envs/canari/bin/python experiments/ewma_drift_attribution/scripts/run_experiment.py --workers 6
 PYTHONPATH=$SRC /opt/miniconda3/envs/canari/bin/python experiments/ewma_drift_attribution/scripts/summarize.py --tag RUN_TAG
+PYTHONPATH=$SRC /opt/miniconda3/envs/canari/bin/python experiments/ewma_drift_attribution/scripts/plot_states.py --tag RUN_TAG
 ```
+
+`plot_states.py` draws, per scenario and seed (default seeds 1 and 5), one column per
+arm and one row per hidden state over the test split, with the true values and the
+±τ tolerances. Seed 5 is included because its offline snapshot left the trend at about
+0.6 δ; it was chosen after the run.
