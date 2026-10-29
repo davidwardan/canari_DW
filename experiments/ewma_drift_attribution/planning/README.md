@@ -157,10 +157,17 @@ SRC=/Users/davidwardan/canari_DW/src
 PYTHONPATH=$SRC /opt/miniconda3/envs/canari/bin/python -m pytest experiments/ewma_drift_attribution/scripts/test_experiment.py -q
 PYTHONPATH=$SRC /opt/miniconda3/envs/canari/bin/python experiments/ewma_drift_attribution/scripts/run_experiment.py --workers 6
 PYTHONPATH=$SRC /opt/miniconda3/envs/canari/bin/python experiments/ewma_drift_attribution/scripts/summarize.py --tag RUN_TAG
-PYTHONPATH=$SRC /opt/miniconda3/envs/canari/bin/python experiments/ewma_drift_attribution/scripts/plot_states.py --tag RUN_TAG
+PYTHONPATH=$SRC /opt/miniconda3/envs/canari/bin/python experiments/ewma_drift_attribution/scripts/history.py --tag RUN_TAG
+PYTHONPATH=$SRC /opt/miniconda3/envs/canari/bin/python experiments/ewma_drift_attribution/scripts/plot_states.py --history-tag HISTORY_TAG
 ```
 
-`plot_states.py` draws, per scenario and seed (default seeds 1 and 5), one column per
-arm and one row per hidden state over the test split, with the true values and the
-±τ tolerances. Seed 5 is included because its offline snapshot left the trend at about
-0.6 δ; it was chosen after the run.
+The evaluation runs save the test split only. `history.py` re-runs selected runs (default
+seeds 1 and 5, every scenario, `none`, `frozen` and every κ) from their snapshots and
+saves the whole series in new run folders, checking that the test part reproduces the
+original run. `plot_states.py` then draws one figure per scenario, seed and arm in
+`figures/<history tag>_states/<scenario>/`, with the deck notation $y_t$,
+$z^{\mathtt{L}}_t$, $z^{\mathtt{T}}_t$, $z^{(\mathtt{O})}_t$, $z^{\mathtt{V}}_t$,
+$z^{\mathtt{M}_{\mathtt{s}}}_t$ and $s_t$, the true values and the ±τ tolerances. Before
+the test split the states are the selected snapshot's frozen filter, not the training
+epochs. Seed 5 is included because its offline snapshot left the trend at about 0.6 δ;
+it was chosen after the run.

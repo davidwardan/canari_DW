@@ -299,6 +299,56 @@ def run_online(model: Model, all_data: dict, online: str):
     return mean[test], std[test], hidden
 
 
+def run_full_history(snapshot: dict, arm: str, leak: tuple, all_data: dict):
+    """Predictions and filtered states over the whole series, for the state figures.
+
+    For RSR arms the frozen warm-up before the first replay window is reconstructed with
+    the same arm model, as `rsr_filter` runs it internally; RSR then returns that window
+    and every test step. Before the test split these are the selected snapshot's
+    filtered states, not the states of the training epochs.
+    """
+
+    model = arm_model(snapshot, arm, leak)
+    if ARMS[arm]["online"] == "frozen":
+        model.lstm_net.num_samples = len(all_data["y"])
+        model.lstm_net.eval()
+        parts = [model.filter(all_data, train_lstm=False)]
+    else:
+        prefix_end = TEST_START - WINDOW_LEN
+        prefix_model = arm_model(snapshot, arm, leak)
+        prefix_model.lstm_net.num_samples = max(prefix_end, WINDOW_LEN + 1)
+        prefix_model.lstm_net.eval()
+        prefix = {key: values[:prefix_end] for key, values in all_data.items()}
+        parts = [prefix_model.filter(prefix, train_lstm=False),
+                 model.rsr_filter(data=all_data, start=TEST_START, window_len=WINDOW_LEN,
+                                  strategy=STRATEGY, include_warmup=True)]
+    hidden = {name: tuple(np.concatenate([getattr(states, getter)(name, "posterior")
+                                          for _, _, states in parts])
+                          for getter in ("get_mean", "get_std"))
+              for name in model.states_name}
+    return (np.concatenate([part[0] for part in parts]),
+            np.concatenate([part[1] for part in parts]), hidden)
+
+
+def states_frame(data: pd.DataFrame, scenario: str, start: int, mean, std, hidden: dict,
+                 y_mean: float, y_std: float) -> pd.DataFrame:
+    """Predictions and hidden states from `start` on, back in data units.
+
+    The level carries the standardization mean; the other states are additive.
+    """
+
+    states = pd.DataFrame(
+        {"obs": data["values"].to_numpy()[start:], "mean": mean * y_std + y_mean,
+         "std": std * y_std, "pattern": true_pattern(scenario)[start:]},
+        index=data.index[start:],
+    )
+    for name, (mu, sd) in hidden.items():
+        column = name.replace(" ", "_")
+        states[f"{column}_mean"] = mu * y_std + (y_mean if name == "level" else 0.0)
+        states[f"{column}_std"] = sd * y_std
+    return states
+
+
 def run_evaluation(job: dict) -> dict:
     """Stage 2: one (scenario, arm, seed) from its stage-1 snapshot."""
 
@@ -331,20 +381,9 @@ def run_evaluation(job: dict) -> dict:
         return row
     row["seconds"] = time.time() - start_time
 
-    # Back to data units; the level carries the standardization mean.
-    obs = data["values"].to_numpy()[TEST_START:]
-    true = true_pattern(scenario)[TEST_START:]
-    states = pd.DataFrame(
-        {"obs": obs, "mean": mean * y_std + y_mean, "std": std * y_std, "pattern": true},
-        index=data.index[TEST_START:],
-    )
-    for name, (mu, sd) in hidden.items():
-        column = name.replace(" ", "_")
-        states[f"{column}_mean"] = mu * y_std + (y_mean if name == "level" else 0.0)
-        states[f"{column}_std"] = sd * y_std
-    if len(states) != NUM_STEPS - TEST_START:
-        raise RuntimeError(f"{arm}: {len(states)} test states")
+    states = states_frame(data, scenario, TEST_START, mean, std, hidden, y_mean, y_std)
     states.to_csv(out_dir / "states.csv")
+    obs, true = states["obs"].to_numpy(), states["pattern"].to_numpy()
 
     row.update(score(obs, states["mean"].to_numpy(), states["std"].to_numpy()))
     after = slice(CHANGE_START - TEST_START, None)
