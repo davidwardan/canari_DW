@@ -8,6 +8,8 @@ is carried, with opposite sign, by the LSTM or the noise:
 
 - `level_kept_year1`, `level_kept_test`: mean level difference (offset minus no-offset run)
   over weeks 52-103 and over the test split, as a fraction of the offset (0: corrected);
+- `level_kept_rms_test`: RMS of that difference over the test split; unlike the mean, it
+  does not cancel when the two runs drift apart in either direction;
 - `lstm_took_test`: minus the mean LSTM difference over the test split, as a fraction of
   the offset (0: the LSTM did not take any of it);
 - `weeks_to_correct`: first week from which the level difference stays below 10% of the
@@ -37,6 +39,7 @@ from zoneinfo import ZoneInfo
 
 import run_experiment as rx
 import summarize as sm  # sets the shared plotting defaults before pyplot loads
+from metrics import rms
 
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
@@ -44,8 +47,9 @@ import pandas as pd  # noqa: E402
 
 OFFSET, OFFSET_STD = 0.5, 0.5  # data units
 SUBDIR = "level_offset"
-METRICS = ["level_kept_year1", "level_kept_test", "lstm_took_test", "weeks_to_correct",
-           "corrected", "level_rmse", "trend_rmse", "rmse", "ll", "crps", "coverage_95"]
+METRICS = ["level_kept_year1", "level_kept_test", "level_kept_rms_test", "lstm_took_test",
+           "weeks_to_correct", "corrected", "level_rmse", "trend_rmse", "rmse", "ll", "crps",
+           "coverage_95"]
 
 log = logging.getLogger("experiment")
 
@@ -58,6 +62,20 @@ def correction_time(level_kept) -> dict:
     weeks = int(uncorrected[-1] + 1) if uncorrected.size else 0
     return {"weeks_to_correct": weeks if corrected else len(level_kept),
             "corrected": float(corrected)}
+
+
+def paired_metrics(states: pd.DataFrame, reference: pd.DataFrame) -> dict:
+    """Offset run minus its no-offset twin, as fractions of the offset."""
+
+    level = (states["level_mean"].to_numpy() - reference["level_mean"].to_numpy()) / OFFSET
+    lstm = (states["lstm_mean"].to_numpy() - reference["lstm_mean"].to_numpy()) / OFFSET
+    return {
+        "level_kept_year1": float(level[rx.PERIOD:2 * rx.PERIOD].mean()),
+        "level_kept_test": float(level[rx.TEST_START:].mean()),
+        "level_kept_rms_test": rms(level[rx.TEST_START:]),
+        "lstm_took_test": float(-lstm[rx.TEST_START:].mean()),
+        **correction_time(level),
+    }
 
 
 def run_offset(job: dict) -> dict:
@@ -91,15 +109,7 @@ def run_offset(job: dict) -> dict:
     states.to_csv(out_dir / "full_states.csv")
 
     reference = pd.read_csv(Path(job["reference_run"]) / "full_states.csv")
-    level = (states["level_mean"].to_numpy() - reference["level_mean"].to_numpy()) / OFFSET
-    lstm = (states["lstm_mean"].to_numpy() - reference["lstm_mean"].to_numpy()) / OFFSET
-    row.update({
-        "level_kept_year1": float(level[rx.PERIOD:2 * rx.PERIOD].mean()),
-        "level_kept_test": float(level[rx.TEST_START:].mean()),
-        "lstm_took_test": float(-lstm[rx.TEST_START:].mean()),
-        **correction_time(level),
-        **rx.score_test_split(states),
-    })
+    row.update({**paired_metrics(states, reference), **rx.score_test_split(states)})
     (out_dir / "metrics.json").write_text(json.dumps(row, indent=2))
     log.info("COMPLETE %s", json.dumps(row))
     rx.stop_log(handler)
@@ -114,14 +124,14 @@ def summarize(runs: pd.DataFrame, batch_dir: Path, figures_dir: Path, tag: str) 
              f"Week-0 level shifted by +{OFFSET} with prior std {OFFSET_STD} (data units); "
              "fractions of the offset, paired with the run without offset. "
              "Definitions: `scripts/offset.py`.", "",
-             sm.table(seed_means, METRICS[:5], "series (each series averaged over seeds)"), "",
-             sm.table(seed_means, METRICS[5:], "series (each series averaged over seeds)"), ""]
+             sm.table(seed_means, METRICS[:6], "series (each series averaged over seeds)"), "",
+             sm.table(seed_means, METRICS[6:], "series (each series averaged over seeds)"), ""]
     (batch_dir / "summary.md").write_text("\n".join(lines))
     print("\n".join(lines))
 
-    rows = (("level_kept_year1", "level kept, year 1"), ("level_kept_test", "level kept, test"),
-            ("lstm_took_test", "LSTM took, test"), ("level_rmse", "level RMSE"))
-    fig, axes = plt.subplots(len(rows), 1, sharex=True, figsize=(3.5, 4.6))
+    rows = (("level_kept_year1", "kept, year 1"), ("level_kept_rms_test", "RMS diff., test"),
+            ("corrected", "corrected"), ("level_rmse", "level RMSE"))
+    fig, axes = plt.subplots(len(rows), 1, sharex=True, figsize=(3.5, 5.2))
     grouped = seed_means.groupby("arm")
     for ax, (metric, label) in zip(axes, rows):
         sm.draw(ax, grouped[metric].mean(), grouped[metric].std())
@@ -134,11 +144,32 @@ def summarize(runs: pd.DataFrame, batch_dir: Path, figures_dir: Path, tag: str) 
     sm.save(fig, figures_dir, f"{tag}_offset_vs_kappa")
 
 
+def resummarize(tag: str) -> None:
+    """Recompute the paired metrics of a finished offset run from its saved states."""
+
+    batch_dir = rx.EXP_DIR / "results" / SUBDIR / tag
+    runs = pd.read_csv(batch_dir / "metrics.csv")
+    for job in json.loads((batch_dir / "jobs.json").read_text())["evaluation"]:
+        name = Path(job["out_dir"]).name
+        if runs.loc[runs["run"] == name, "status"].item() == "complete":
+            metrics = paired_metrics(pd.read_csv(Path(job["out_dir"]) / "full_states.csv"),
+                                     pd.read_csv(Path(job["reference_run"]) / "full_states.csv"))
+            for key, value in metrics.items():
+                runs.loc[runs["run"] == name, key] = value
+    runs.to_csv(batch_dir / "metrics.csv", index=False)
+    summarize(runs, batch_dir, rx.EXP_DIR / "figures" / SUBDIR, tag)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--tag", required=True, help="finished run whose snapshots are reused")
+    parser.add_argument("--tag", help="finished run whose snapshots are reused")
+    parser.add_argument("--resummarize", metavar="OFFSET_TAG",
+                        help="recompute metrics and summary of a finished offset run")
     parser.add_argument("--workers", type=int, default=6)
     args = parser.parse_args()
+    if args.resummarize:
+        resummarize(args.resummarize)
+        return
 
     tag = datetime.now(ZoneInfo("America/Toronto")).strftime("%Y%m%d-%H%M%S") + "_offset"
     results_dir = rx.EXP_DIR / "results" / SUBDIR
