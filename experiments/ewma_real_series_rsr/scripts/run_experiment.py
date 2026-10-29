@@ -59,6 +59,7 @@ STRATEGY = "replay_smoothed"
 FAST_SPAN, SLOW_SPAN = 2 * PERIOD, 4 * PERIOD
 KAPPAS = (4, 2, 1, 0.5, 0.25, 0.125)
 LEVEL_VAR, TREND_VAR = 1e-4, 1e-6  # canari's auto-initialization variances
+INFER_LEN = PERIOD  # LstmNetwork infer_len: canari infers 3x this many weeks before week 0
 TOY_NUM_STEPS = 900  # `--series toy`: pipeline check with a known pattern
 TOY_STD_NOISE = 0.1
 
@@ -77,13 +78,17 @@ SOURCE_FILES = ("model.py", "rsr.py", "common.py", "component/ewma_component.py"
 log = logging.getLogger("experiment")
 
 
+def toy_pattern(time_step) -> np.ndarray:
+    return (np.sin(2 * np.pi * time_step / PERIOD)
+            + 0.5 * np.sin(4 * np.pi * time_step / PERIOD + np.pi / 4))
+
+
 def detrended_series(name: str) -> pd.DataFrame:
     """The provider's detrended series, or the toy pattern plus noise."""
 
     if name == "toy":
         time_step = np.arange(TOY_NUM_STEPS)
-        values = (np.sin(2 * np.pi * time_step / PERIOD)
-                  + 0.5 * np.sin(4 * np.pi * time_step / PERIOD + np.pi / 4)
+        values = (toy_pattern(time_step)
                   + np.random.default_rng(0).normal(0, TOY_STD_NOISE, TOY_NUM_STEPS))
         index = pd.date_range("2000-01-02", periods=TOY_NUM_STEPS, freq="7D")
         return pd.DataFrame({"values": values}, index=pd.Index(index, name="date_time"))
@@ -145,7 +150,7 @@ def taus_of(snapshot: str, leak: tuple):
     return kappa * leak[0], kappa * leak[1]
 
 
-def build_model(sigma_v: float, seed: int, taus=None) -> Model:
+def build_model(sigma_v: float, seed: int, taus=None, infer_len: int = INFER_LEN) -> Model:
     """`taus=None` builds the model without the constraint component."""
 
     components = [
@@ -153,7 +158,7 @@ def build_model(sigma_v: float, seed: int, taus=None) -> Model:
         LstmNetwork(
             look_back_len=PERIOD,
             num_features=2,
-            infer_len=PERIOD,
+            infer_len=infer_len,
             num_hidden_unit=NUM_HIDDEN_UNIT,
             num_layer=1,
             manual_seed=seed,
@@ -181,12 +186,12 @@ def set_baseline(model: Model, baseline: tuple) -> None:
 
 
 def train_offline(data_processor, sigma_v: float, seed: int, taus, baseline: tuple,
-                  max_epochs: int):
+                  max_epochs: int, infer_len: int = INFER_LEN):
     """Train with validation early stopping; every epoch starts from `baseline`."""
 
     train_data, validation_data, _, _ = data_processor.get_splits()
     validation_obs = validation_data["y"].flatten()
-    model = build_model(sigma_v, seed, taus)
+    model = build_model(sigma_v, seed, taus, infer_len)
     set_baseline(model, baseline)
 
     history = []
@@ -254,7 +259,8 @@ def run_training(job: dict) -> dict:
     candidates, candidate_status = [], []
     for sigma_v in SIGMA_V_GRID:
         best_log_lik, optimal_epoch, snapshot, history, status = train_offline(
-            data_processor, float(sigma_v), seed, taus, baseline, job["max_epochs"])
+            data_processor, float(sigma_v), seed, taus, baseline, job["max_epochs"],
+            job["infer_len"])
         candidates.append((best_log_lik, float(sigma_v), optimal_epoch, snapshot))
         candidate_status.append({"sigma_v": float(sigma_v), **status})
         pd.DataFrame({"validation_ll": history}).to_csv(
@@ -283,21 +289,32 @@ def run_training(job: dict) -> dict:
                if key not in ("candidates", "candidate_status")}}
 
 
-def run_full(snapshot: dict, online: str, all_data: dict):
+def load_model(snapshot: dict, level_shift=None) -> Model:
+    """`level_shift`: (mean shift, variance) of the week-0 level, normalized units."""
+
+    model = Model.load_dict(snapshot)
+    if level_shift is not None:
+        index = model.get_states_index("level")
+        model.mu_states[index] += level_shift[0]
+        model.var_states[index, index] = level_shift[1]
+    return model
+
+
+def run_full(snapshot: dict, online: str, all_data: dict, level_shift=None):
     """Predictions and filtered states over the whole series.
 
     RSR: the frozen warm-up before the first replay window is reconstructed exactly as
     `rsr_filter` runs it internally, then RSR returns that window and the test split.
     """
 
-    model = Model.load_dict(snapshot)
+    model = load_model(snapshot, level_shift)
     if online == "frozen":
         model.lstm_net.num_samples = len(all_data["y"])
         model.lstm_net.eval()
         parts = [model.filter(all_data, train_lstm=False)]
     else:
         prefix_end = TEST_START - WINDOW_LEN
-        prefix_model = Model.load_dict(snapshot)
+        prefix_model = load_model(snapshot, level_shift)
         prefix_model.lstm_net.num_samples = max(prefix_end, WINDOW_LEN + 1)
         prefix_model.lstm_net.eval()
         prefix = {key: values[:prefix_end] for key, values in all_data.items()}
@@ -310,6 +327,34 @@ def run_full(snapshot: dict, online: str, all_data: dict):
               for name in model.states_name}
     return (np.concatenate([part[0] for part in parts]),
             np.concatenate([part[1] for part in parts]), hidden)
+
+
+def states_frame(data: pd.DataFrame, baseline, mean, std, hidden: dict, y_mean: float,
+                 y_std: float) -> pd.DataFrame:
+    """Predictions and hidden states over the whole series, back in data units.
+
+    The level carries the standardization mean; the other states are additive.
+    """
+
+    states = pd.DataFrame({"obs": data["values"].to_numpy(), "mean": mean * y_std + y_mean,
+                           "std": std * y_std, "baseline": baseline}, index=data.index)
+    for name, (mu, sd) in hidden.items():
+        column = name.replace(" ", "_")
+        states[f"{column}_mean"] = mu * y_std + (y_mean if name == "level" else 0.0)
+        states[f"{column}_std"] = sd * y_std
+    states.insert(0, "split", np.where(np.arange(len(states)) < TRAIN_LEN, "train",
+                                       np.where(np.arange(len(states)) < TEST_START,
+                                                "validation", "test")))
+    return states
+
+
+def score_test_split(states: pd.DataFrame) -> dict:
+    """Level and trend RMSE against the truth, and predictive scores, on the test split."""
+
+    test = states.iloc[TEST_START:]
+    return {"level_rmse": rms(test["level_mean"] - test["baseline"]),
+            "trend_rmse": rms(test["trend_mean"] - SLOPE),
+            **score(test["obs"].to_numpy(), test["mean"].to_numpy(), test["std"].to_numpy())}
 
 
 def run_evaluation(job: dict) -> dict:
@@ -343,22 +388,9 @@ def run_evaluation(job: dict) -> dict:
         return row
     row["seconds"] = time.time() - start_time
 
-    # Back to data units; the level carries the standardization mean.
-    states = pd.DataFrame({"obs": data["values"].to_numpy(), "mean": mean * y_std + y_mean,
-                           "std": std * y_std, "baseline": baseline}, index=data.index)
-    for name, (mu, sd) in hidden.items():
-        column = name.replace(" ", "_")
-        states[f"{column}_mean"] = mu * y_std + (y_mean if name == "level" else 0.0)
-        states[f"{column}_std"] = sd * y_std
-    states.insert(0, "split", np.where(np.arange(len(states)) < TRAIN_LEN, "train",
-                                       np.where(np.arange(len(states)) < TEST_START,
-                                                "validation", "test")))
+    states = states_frame(data, baseline, mean, std, hidden, y_mean, y_std)
     states.to_csv(out_dir / "full_states.csv")
-
-    test = states.iloc[TEST_START:]
-    row["level_rmse"] = rms(test["level_mean"] - test["baseline"])
-    row["trend_rmse"] = rms(test["trend_mean"] - SLOPE)
-    row.update(score(test["obs"].to_numpy(), test["mean"].to_numpy(), test["std"].to_numpy()))
+    row.update(score_test_split(states))
     (out_dir / "metrics.json").write_text(json.dumps(row, indent=2))
     log.info("COMPLETE %s", json.dumps(row))
     stop_log(handler)
@@ -378,6 +410,8 @@ def main():
     parser.add_argument("--seeds", type=int, nargs="+", default=list(SEEDS))
     parser.add_argument("--arms", nargs="+", choices=ARMS, default=list(ARMS))
     parser.add_argument("--max-epochs", type=int, default=MAX_EPOCHS)
+    parser.add_argument("--infer-len", type=int, default=INFER_LEN,
+                        help="LstmNetwork infer_len; canari infers 3x this many weeks before week 0")
     parser.add_argument("--tag-suffix", default="", help="e.g. _smoke")
     args = parser.parse_args()
 
@@ -394,7 +428,7 @@ def main():
         "arms": {arm: ARMS[arm] for arm in args.arms}, "slope": SLOPE, "period": PERIOD,
         "train_len": TRAIN_LEN, "validation_len": VALIDATION_LEN, "test_start": TEST_START,
         "sigma_v_grid": SIGMA_V_GRID.tolist(), "max_epochs": args.max_epochs,
-        "patience": PATIENCE, "num_hidden_unit": NUM_HIDDEN_UNIT, "local_trend_std": 0.0,
+        "infer_len": args.infer_len, "patience": PATIENCE, "num_hidden_unit": NUM_HIDDEN_UNIT, "local_trend_std": 0.0,
         "initial_variances": {"level": LEVEL_VAR, "trend": TREND_VAR},
         "rsr_window_len": WINDOW_LEN, "rsr_strategy": STRATEGY, "fast_span": FAST_SPAN,
         "slow_span": SLOW_SPAN, "kappas": KAPPAS, "data_dir": str(DATA_DIR),
@@ -408,7 +442,7 @@ def main():
     run_dir = EXP_DIR / "results"
     training_jobs = [
         {"run_tag": run_tag, "series": series, "snapshot": kind, "seed": seed,
-         "max_epochs": args.max_epochs,
+         "max_epochs": args.max_epochs, "infer_len": args.infer_len,
          "out_dir": str(run_dir / f"{run_tag}_train_{series}_{kind}_seed{seed}")}
         for series in args.series for kind in snapshots for seed in args.seeds
     ]

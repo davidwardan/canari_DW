@@ -84,6 +84,24 @@ means, in data units (see `metrics.md`). Secondary: one-step predictive RMSE, lo
 likelihood, CRPS and 95% coverage. Mean ± std over seeds per series, and the mean over
 series of the seed means.
 
+## Follow-ups (added 2026-10-28, after the first real run)
+
+**Longer inferred start (`--infer-len`).** At week 0 the LSTM starts from a look-back that
+canari's LSTM smoother infers before the data (`3 × infer_len` weeks; 155 weeks for the
+default 52). The first year of LSTM output was poor, so the user asked for a longer inferred
+stretch. Toy pilot (5 seeds, `frozen`, `rsr`, `frozen_ewma_k1`, `rsr_ewma_k1`) with
+`infer_len` 52, 104, 208; `startup.py` reports the look-back error against the true past,
+the year-0 LSTM error, the largest trend deviation in training and the level error at the
+test start. The real series are then re-run with `--infer-len 208` (tag suffix `_infer208`).
+
+**Level-offset test (`offset.py`, in `results/level_offset/` and `figures/level_offset/`).**
+The snapshots of a finished run are re-run over the whole series with the week-0 level
+shifted by +0.5 (data units) and given a prior standard deviation of 0.5, so the filter can
+correct it. Each run is paired with the same arm, snapshot and seed without offset; since
+level + LSTM + noise = y exactly, the share of the offset the level keeps is the share the
+LSTM or the noise takes instead. RSR only learns from week 260, so the week-0 offset is
+first met by the frozen pass in every arm.
+
 ## Verification before the real run
 
 1. Focused tests: the baseline reset before every epoch, the conversion of the true
@@ -106,4 +124,9 @@ PYTHONPATH=$SRC /opt/miniconda3/envs/canari/bin/python experiments/ewma_real_ser
 PYTHONPATH=$SRC /opt/miniconda3/envs/canari/bin/python experiments/ewma_real_series_rsr/scripts/run_experiment.py
 PYTHONPATH=$SRC /opt/miniconda3/envs/canari/bin/python experiments/ewma_real_series_rsr/scripts/summarize.py --tag RUN_TAG
 PYTHONPATH=$SRC /opt/miniconda3/envs/canari/bin/python experiments/ewma_real_series_rsr/scripts/plot_states.py --tag RUN_TAG
+# follow-ups
+PYTHONPATH=$SRC /opt/miniconda3/envs/canari/bin/python experiments/ewma_real_series_rsr/scripts/run_experiment.py --series toy --infer-len 208 --arms frozen rsr frozen_ewma_k1 rsr_ewma_k1 --tag-suffix _infer208
+PYTHONPATH=$SRC /opt/miniconda3/envs/canari/bin/python experiments/ewma_real_series_rsr/scripts/startup.py --tags TAG [TAG ...]
+PYTHONPATH=$SRC /opt/miniconda3/envs/canari/bin/python experiments/ewma_real_series_rsr/scripts/offset.py --tag RUN_TAG
+PYTHONPATH=$SRC /opt/miniconda3/envs/canari/bin/python experiments/ewma_real_series_rsr/scripts/plot_states.py --tag level_offset/OFFSET_TAG
 ```

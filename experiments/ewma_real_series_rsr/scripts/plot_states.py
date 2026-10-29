@@ -16,6 +16,7 @@ Figures go to `figures/<tag>_states/<series>/`.
 
 import argparse
 import json
+import multiprocessing
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -65,7 +66,9 @@ def plot_run(job: dict, figures_dir: Path) -> Path:
                  markersize=1)
     band(axes[0], years, states["mean"], states["std"])
     axes[0].set_ylabel(r"$y_t$")
-    axes[0].set_title(rf"{series} + $0.005\,t$ $\mid$ {arm_text(arm)} $\mid$ seed {seed}",
+    offset = (rf" $\mid$ level started {job['level_offset']:+g} off (std {job['level_offset_std']:g})"
+              if "level_offset" in job else "")
+    axes[0].set_title(rf"{series} + $0.005\,t$ $\mid$ {arm_text(arm)} $\mid$ seed {seed}{offset}",
                       loc="left", fontsize=8)
     for ax, (column, label) in zip(axes[1:], STATES):
         band(ax, years, states[f"{column}_mean"], states[f"{column}_std"])
@@ -119,15 +122,18 @@ def plot_run(job: dict, figures_dir: Path) -> Path:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--tag", required=True)
+    parser.add_argument("--tag", required=True, help="run tag, e.g. level_offset/TAG")
     parser.add_argument("--seeds", type=int, nargs="+", default=[1])
     parser.add_argument("--arms", nargs="+", choices=rx.ARMS, default=list(rx.ARMS))
+    parser.add_argument("--workers", type=int, default=6)
     args = parser.parse_args()
     jobs = json.loads((rx.EXP_DIR / "results" / args.tag / "jobs.json").read_text())
     figures_dir = rx.EXP_DIR / "figures" / f"{args.tag}_states"
-    for job in jobs["evaluation"]:
-        if job["seed"] in args.seeds and job["arm"] in args.arms:
-            print("saved", plot_run(job, figures_dir).relative_to(rx.EXP_DIR))
+    selected = [(job, figures_dir) for job in jobs["evaluation"]
+                if job["seed"] in args.seeds and job["arm"] in args.arms]
+    with multiprocessing.get_context("spawn").Pool(args.workers) as pool:
+        for path in pool.starmap(plot_run, selected):
+            print("saved", path.relative_to(rx.EXP_DIR))
 
 
 if __name__ == "__main__":
