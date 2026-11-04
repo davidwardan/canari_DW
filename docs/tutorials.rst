@@ -14,4 +14,5 @@ This section present a collection of tutorials that will walk you through the ma
    examples/forecasting_with_lstm_multivariate
    examples/anomaly_detection
    examples/parameter_tuning
+   ewma
    examples/read_DAT_file

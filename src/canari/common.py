@@ -56,6 +56,34 @@ def calc_observation(
     return mu_obs_predict, var_obs_predict
 
 
+def gaussian_condition(
+    mu_states: np.ndarray,
+    var_states: np.ndarray,
+    observation_matrix: np.ndarray,
+    var_noise: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Condition hidden states on zero-valued linear pseudo-observations
+    `0 = observation_matrix @ x + v`, with `v ~ N(0, var_noise)`. The Joseph form keeps
+    the small variances of strongly constrained states positive.
+
+    Args:
+        mu_states (np.ndarray): Mean vector of the state variables.
+        var_states (np.ndarray): Covariance matrix of the state variables.
+        observation_matrix (np.ndarray): One row per pseudo-observation.
+        var_noise (np.ndarray): Covariance matrix of the pseudo-observation noise.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: Conditional mean and covariance of the states.
+    """
+    var_innovation = observation_matrix @ var_states @ observation_matrix.T + var_noise
+    gain = np.linalg.solve(var_innovation, observation_matrix @ var_states).T
+    mu_states = mu_states - gain @ (observation_matrix @ mu_states)
+    residual = np.eye(len(mu_states)) - gain @ observation_matrix
+    var_states = residual @ var_states @ residual.T + gain @ var_noise @ gain.T
+    return mu_states, (var_states + var_states.T) / 2
+
+
 def forward(
     mu_states_posterior: np.ndarray,
     var_states_posterior: np.ndarray,

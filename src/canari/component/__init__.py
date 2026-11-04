@@ -5,6 +5,7 @@ from canari.component.baseline_component import (
     LocalTrend,
     LocalAcceleration,
 )
+from canari.component.ewma_component import EwmaConstraint
 from canari.component.exponential_component import Exponential
 from canari.component.lstm_component import LstmNetwork
 from canari.component.periodic_component import Periodic

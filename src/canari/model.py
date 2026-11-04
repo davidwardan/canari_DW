@@ -32,7 +32,7 @@ from canari import common
 from canari.data_struct import LstmOutputHistory, StatesHistory, OutputHistory
 from canari.common import GMA
 from canari.data_process import DataProcess
-from canari.component import Intervention
+from canari.component import EwmaConstraint, Intervention
 
 class Model:
     """
@@ -197,6 +197,9 @@ class Model:
         self.mu_W2_prior = None
         self.var_W2_prior = None
 
+        # EWMA-related attributes
+        self.ewma_constraints = []
+
         # Noise related attribute
         self.sched_sigma_v = None
         self._var_v2bar_prior = None
@@ -230,6 +233,7 @@ class Model:
         self._assemble_states()
         self._initialize_lstm_network()
         self._initialize_autoregression()
+        self._initialize_ewma()
 
     def _assemble_matrices(self):
         """
@@ -329,6 +333,77 @@ class Model:
         if "AR_error" in self.states_name:
             self.mu_W2bar = autoregression_component.mu_states[-1]
             self.var_W2bar = autoregression_component.var_states[-1]
+
+    def _initialize_ewma(self):
+        """
+        Assemble the coupling and the pseudo-observations of the EWMA constraints.
+        Only applicable when using the EwmaConstraint component. Recall it whenever
+        the state space changes, e.g., when SKF aligns its models.
+        """
+
+        self.ewma_constraints = [
+            component
+            for component in self.components.values()
+            if isinstance(component, EwmaConstraint)
+        ]
+        sources = [constraint.source for constraint in self.ewma_constraints]
+        if len(set(sources)) != len(sources):
+            raise ValueError("Each EwmaConstraint must have a distinct source state.")
+
+        # The source's current prediction enters its EWMAs after the transition step.
+        self._ewma_coupling = np.eye(self.num_states)
+        self._ewma_indices = []
+        matrices, variances = [], []
+        for constraint in self.ewma_constraints:
+            source_index = self.get_states_index(constraint.source)
+            if not isinstance(source_index, int):
+                raise ValueError(
+                    f"Unknown EwmaConstraint source state: {constraint.source!r}."
+                )
+            memory_indices = [
+                self.get_states_index(name) for name in constraint.states_name
+            ]
+            self._ewma_coupling[memory_indices, source_index] = constraint.weights
+            matrix, variance = constraint.constraint_observation(
+                self.num_states, memory_indices
+            )
+            matrices.append(matrix)
+            variances.append(variance)
+            self._ewma_indices.extend(memory_indices)
+
+        for constraint in self.ewma_constraints:
+            if self.get_states_index(constraint.source) in self._ewma_indices:
+                raise ValueError("An EwmaConstraint source cannot be another EWMA.")
+
+        self._ewma_matrix = np.vstack(matrices) if matrices else None
+        self._ewma_var_noise = np.diag(np.concatenate(variances)) if matrices else None
+
+    def _ewma_forward_modification(self, mu_states_prior, var_states_prior):
+        """
+        Add the source predictions to their EWMAs, then condition the prior on the
+        zero-valued pseudo-observations of the EWMA constraints. The prediction before
+        this conditioning is kept for the smoother and for the LSTM's learning messages.
+
+        Args:
+            mu_states_prior (np.ndarray): Prior mean vector from the transition step.
+            var_states_prior (np.ndarray): Prior covariance matrix from the transition
+                step.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]: Constrained prior mean and covariance.
+        """
+
+        coupling = self._ewma_coupling
+        self._mu_states_transition = coupling @ mu_states_prior
+        self._var_states_transition = coupling @ var_states_prior @ coupling.T
+        if len(self._ewma_matrix) == 0:
+            return self._mu_states_transition.copy(), self._var_states_transition.copy()
+        return common.gaussian_condition(
+            self._mu_states_transition,
+            self._var_states_transition,
+            self._ewma_matrix,
+            self._ewma_var_noise,
+        )
 
     def _set_posterior_states(
         self,
@@ -919,8 +994,13 @@ class Model:
         at two consecutive time steps for later use in Kalman's smoother.
         """
 
-        self.states.mu_prior.append(self.mu_states_prior)
-        self.states.var_prior.append(self.var_states_prior)
+        mu_states_prior, var_states_prior = self.mu_states_prior, self.var_states_prior
+        if self.ewma_constraints:
+            # The smoother needs the prediction before the EWMA pseudo-observations.
+            mu_states_prior = self._mu_states_transition
+            var_states_prior = self._var_states_transition
+        self.states.mu_prior.append(mu_states_prior)
+        self.states.var_prior.append(var_states_prior)
         self.states.mu_posterior.append(self.mu_states_posterior)
         self.states.var_posterior.append(self.var_states_posterior)
         cov_states = self.var_states @ self.transition_matrix.T
@@ -932,6 +1012,8 @@ class Model:
                 self.mu_states_posterior,
                 self.var_states_posterior,
             )
+        if self.ewma_constraints:
+            cov_states = cov_states @ self._ewma_coupling.T
 
         self.states.cov_states.append(cov_states)
         self.states.mu_smooth.append(self.mu_states_posterior)
@@ -1282,6 +1364,11 @@ class Model:
             if "level" in self.states_name and hasattr(self, "_mu_local_level"):
                 local_level_index = self.get_states_index("level")
                 mu_states[local_level_index] = self._mu_local_level
+            if self.ewma_constraints:
+                # The series starts before its first observation, from known zero EWMAs.
+                mu_states[self._ewma_indices] = 0
+                var_states[self._ewma_indices, :] = 0
+                var_states[:, self._ewma_indices] = 0
 
             if self.lstm_net:
                 if self.lstm_net.smooth:
@@ -1455,6 +1542,14 @@ class Model:
                 mu_states_prior, var_states_prior
             )
 
+        if self.ewma_constraints:
+            mu_states_prior, var_states_prior = self._ewma_forward_modification(
+                mu_states_prior, var_states_prior
+            )
+            mu_obs_pred, var_obs_pred = common.calc_observation(
+                mu_states_prior, var_states_prior, self.observation_matrix
+            )
+
         self.mu_states_prior = mu_states_prior
         self.var_states_prior = var_states_prior
         self.mu_obs_predict = mu_obs_pred
@@ -1548,12 +1643,18 @@ class Model:
         """
 
         lstm_index = self.get_states_index("lstm")
+        var_states_prior = self.var_states_prior
+        if self.ewma_constraints:
+            # The constraint evidence reaches the LSTM too: compare with its raw output.
+            delta_mu_states = self.mu_states_posterior - self._mu_states_transition
+            delta_var_states = self.var_states_posterior - self._var_states_transition
+            var_states_prior = self._var_states_transition
         delta_mu_lstm = np.array(
-            delta_mu_states[lstm_index] / self.var_states_prior[lstm_index, lstm_index]
+            delta_mu_states[lstm_index] / var_states_prior[lstm_index, lstm_index]
         )
         delta_var_lstm = np.array(
             delta_var_states[lstm_index, lstm_index]
-            / self.var_states_prior[lstm_index, lstm_index] ** 2
+            / var_states_prior[lstm_index, lstm_index] ** 2
         )
 
         if self.lstm_net.model_noise:

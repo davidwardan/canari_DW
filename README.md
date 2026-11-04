@@ -20,6 +20,12 @@ The figure above presents an example where the raw data in red is decomposed in 
 ## Getting started
 You can get started with Canari by going through our [tutorials](https://bayes-works.github.io/canari/tutorials.html) covering all the main features of the library.
 
+To constrain a predictor's long-term mean and drift, add
+`EwmaConstraint(source="lstm", fast_span=12, slow_span=48)` to your `Model`.
+It applies during offline training, filtering with frozen or online-updated
+parameters, and forecasting, and can target any scalar hidden state. See the
+[EWMA guide](docs/ewma.rst) and the [runnable example](examples/toy_ewma.py).
+
 ## Installation
 Canari available on PyPI, for installation, execute the following command in Terminal:
 ```

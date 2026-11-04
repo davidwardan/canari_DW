@@ -268,6 +268,19 @@ class SKF:
             states_diff (list[str]): Names of states added to source_model.
         """
 
+        ewma_states = [
+            {
+                name
+                for constraint in model.ewma_constraints
+                for name in constraint.states_name
+            }
+            for model in (soure_model, target_model)
+        ]
+        if ewma_states[0] != ewma_states[1]:
+            raise ValueError(
+                "Normal and abnormal models need matching EwmaConstraint components."
+            )
+
         pad_row = np.zeros((soure_model.num_states)).flatten()
         pad_col = np.zeros((target_model.num_states)).flatten()
         states_diff = []
@@ -298,6 +311,9 @@ class SKF:
             target_model.process_noise_matrix[index_noise, index_noise] = (
                 soure_model.process_noise_matrix[index_noise, index_noise]
             )
+        # Padding shifts the indices of EWMA sources and memories.
+        soure_model._initialize_ewma()
+        target_model._initialize_ewma()
         return soure_model, target_model, states_diff
 
     def _create_transition_model(
