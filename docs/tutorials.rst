@@ -12,6 +12,7 @@ This section present a collection of tutorials that will walk you through the ma
    examples/forecasting_without_lstm
    examples/forecasting_with_lstm_univariate
    examples/forecasting_with_lstm_multivariate
+   rsr
    examples/anomaly_detection
    examples/parameter_tuning
    examples/read_DAT_file
