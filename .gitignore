@@ -27,3 +27,19 @@ docs/_build/
 
 # Metadata 
 !examples/benchmark/BM_metadata.json
+
+# Experiments
+experiments/*/figures/
+experiments/*/results/
+!experiments/*.json
+!experiments/*.csv
+
+#logs
+*.log
+*.jsonl
+
+# Agents
+.codex/
+.claude/
+
+experiments/*/logs/*.csv
