@@ -6,6 +6,7 @@
    canari.data_struct
    canari.common
    canari.model
+   canari.rsr
    canari.model_assemble
    canari.skf
    canari.optimizer
