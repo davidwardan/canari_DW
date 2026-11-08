@@ -993,6 +993,7 @@ class SKF:
                 self.model["norm_norm"]._estim_hete_noise(
                     mu_v2bar_prior, var_v2bar_prior
                 )
+            self._lstm_prediction = (mu_lstm_pred.item(), var_lstm_pred.item())
 
         else:
             mu_lstm_pred = None
@@ -1187,6 +1188,8 @@ class SKF:
         self,
         data: Dict[str, np.ndarray],
         intervention: Optional[dict] = None,
+        train_lstm: Optional[bool] = False,
+        reset_memory: Optional[bool] = True,
     ) -> Tuple[np.ndarray, StatesHistory]:
         """
         Run the Kalman filter over an entire dataset.
@@ -1198,6 +1201,10 @@ class SKF:
         Args:
             data (Dict[str, np.ndarray]): Includes 'x' and 'y'.
             intervention (dict, optional): intervention dictionary. Defaults to None.
+            train_lstm (bool): Whether to update the LSTM parameters online.
+                Defaults to False.
+            reset_memory (bool): Whether to restore the SKF's initial memory after
+                filtering. Defaults to True.
 
         Returns:
             Tuple[np.ndarray, StatesHistory]:
@@ -1237,6 +1244,23 @@ class SKF:
             mu_states_posterior, var_states_posterior = self.backward(y)
 
             if self.lstm_net:
+                lstm_index = self.model["norm_norm"].get_states_index("lstm")
+                if train_lstm:
+                    # The network learns from the change relative to its own output.
+                    prior_mu, prior_var = self._lstm_prediction
+                    delta_mu_lstm = np.array(
+                        (mu_states_posterior[lstm_index] - prior_mu) / prior_var
+                    )
+                    delta_var_lstm = np.array(
+                        (var_states_posterior[lstm_index, lstm_index] - prior_var)
+                        / prior_var**2
+                    )
+                    self.lstm_net.set_delta_z(
+                        np.array(np.float32(delta_mu_lstm)),
+                        np.array(np.float32(delta_var_lstm)),
+                    )
+                    self.lstm_net.backward()
+                    self.lstm_net.step()
                 self.model["norm_norm"].update_lstm_output_history(
                     mu_states_posterior, var_states_posterior
                 )
@@ -1257,7 +1281,8 @@ class SKF:
             if intervention and (interv := intervention.get(time)) is not None:
                 self._transition_matrix_interv(interv["mu"], interv["var"], 0)
 
-        self.set_memory(time_step=0)
+        if reset_memory:
+            self.set_memory(time_step=0)
         return (
             np.array(self.filter_marginal_prob_history["abnorm"]),
             self.states,
