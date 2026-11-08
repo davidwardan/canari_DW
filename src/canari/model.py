@@ -953,6 +953,9 @@ class Model:
                 train_data["y"]
             )
 
+        # allocate a restored network's buffers at this capacity
+        self._prepare_lstm_buffers()
+
         # prepare lookback covariates
         lookback_covariates = self._generate_look_back_covariates(train_data)
 
@@ -1095,6 +1098,28 @@ class Model:
             var_states[lstm_index, lstm_index],
         )
 
+    def _prepare_lstm_buffers(self):
+        """Allocate a restored network's buffers without losing its saved memory.
+
+        Defer until first use so training/RSR can set the required sequence capacity.
+        pyTAGI's first forward otherwise overwrites restored recurrent states.
+        """
+        if not getattr(self, "_lstm_buffers_pending", False):
+            return
+        recurrent_states = self.lstm_net.get_lstm_states()
+        component = next(
+            component
+            for component in self.components.values()
+            if "lstm" in component.component_name
+        )
+        size = component.num_features + component.look_back_len - 1
+        self.lstm_net.forward(
+            mu_x=np.zeros(size, dtype=np.float32),
+            var_x=np.zeros(size, dtype=np.float32),
+        )
+        self.lstm_net.set_lstm_states(recurrent_states)
+        self._lstm_buffers_pending = False
+
     def get_dict(self, time_step: Optional[int] = None) -> dict:
         """
         Export model attributes into a serializable dictionary.
@@ -1117,8 +1142,9 @@ class Model:
         save_dict["memory"] = memory
         if self.lstm_net:
             save_dict["lstm_network_params"] = self.lstm_net.state_dict()
+            save_dict["lstm_num_samples"] = self.lstm_net.num_samples
 
-        return save_dict
+        return copy.deepcopy(save_dict)
 
     @staticmethod
     def load_dict(save_dict: dict):
@@ -1136,6 +1162,7 @@ class Model:
             >>> loaded_model = Model.load_dict(saved_dict)
         """
 
+        save_dict = copy.deepcopy(save_dict)
         components = list(save_dict["components"].values())
         model = Model(*components)
 
@@ -1147,6 +1174,12 @@ class Model:
         model.set_memory(memory=save_dict["memory"])
         if model.lstm_net:
             model.lstm_net.load_state_dict(save_dict["lstm_network_params"])
+            model.lstm_net.num_samples = save_dict.get("lstm_num_samples", 1)
+            # Without the forward above, the first forward would erase these states.
+            lstm_states = save_dict["memory"]["lstm_states"] or {}
+            model._lstm_buffers_pending = "cov_names" not in save_dict and any(
+                len(values[0]) for values in lstm_states.values()
+            )
 
         return model
 
@@ -1410,6 +1443,7 @@ class Model:
         # LSTM prediction:
         lstm_states_index = self.get_states_index("lstm")
         if self.lstm_net and mu_lstm_pred is None and var_lstm_pred is None:
+            self._prepare_lstm_buffers()
             if var_input_covariates is not None:
                 mu_lstm_input, var_lstm_input = common.prepare_lstm_input(
                     self.lstm_output_history, input_covariates, var_input_covariates

@@ -977,6 +977,7 @@ class SKF:
         var_states_transit = self._transition()
 
         if self.lstm_net:
+            self.model["norm_norm"]._prepare_lstm_buffers()
             mu_lstm_input, var_lstm_input = common.prepare_lstm_input(
                 self.model["norm_norm"].lstm_output_history, input_covariates
             )
