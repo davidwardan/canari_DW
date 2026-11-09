@@ -178,6 +178,8 @@ class ModelAssemble:
                     model.update_lstm_output_history(
                         model.mu_states_prior, model.var_states_prior
                     )
+                elif model.aux_component:
+                    model.update_aux_context(model.mu_states_prior)
 
                 model._set_posterior_states(
                     model.mu_states_prior, model.var_states_prior
@@ -237,6 +239,8 @@ class ModelAssemble:
                     model.update_lstm_output_history(
                         model.mu_states_posterior, model.var_states_posterior
                     )
+                elif model.aux_component:
+                    model.update_aux_context(model.mu_states_posterior)
                 model.save_states_history()
                 model.set_states(model.mu_states_posterior, model.var_states_posterior)
 

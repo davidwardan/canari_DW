@@ -533,6 +533,12 @@ def plot_skf_states(
     if legend_location:
         axes[len(states_to_plot)].legend(["Pr(Abnormal)"], loc="upper left")
 
+    # plot_data draws the whole series, but the states may start later, e.g. when a
+    # leading segment was set aside as context (see `DataProcess.split_at`). Align
+    # the observation subplot with the others so all of them share one time axis.
+    if plot_observation:
+        axes[0].set_xlim(axes[len(states_to_plot)].get_xlim())
+
     plt.tight_layout()
 
     return fig, axes

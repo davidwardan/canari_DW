@@ -219,6 +219,7 @@ class SKF:
 
         # LSTM-related attributes
         self.lstm_net = None
+        self.aux_component = None
 
         # Early stopping attributes
         self.stop_training = False
@@ -357,6 +358,8 @@ class SKF:
         self.states_name = self.model["norm_norm"].states_name
         if self.model["norm_norm"].lstm_net is not None:
             self.lstm_net = self.model["norm_norm"].lstm_net
+        if self.model["norm_norm"].aux_component is not None:
+            self.aux_component = self.model["norm_norm"].aux_component
 
     def _set_same_states_transition_models(self):
         """
@@ -690,6 +693,24 @@ class SKF:
 
         self.model["norm_norm"].auto_initialize_baseline_states(y)
 
+    def initialize_from_context(self, y: np.ndarray):
+        """
+        Consume a leading segment of a time series as context rather than filtering it.
+        Recall :meth:`~canari.model.Model.initialize_from_context` on the transition
+        model 'norm_norm', which holds the shared
+        :class:`~canari.component.auxiliary_component.Auxiliary` component.
+
+        Args:
+            y (np.ndarray): The leading segment of the time series.
+
+        Examples:
+            >>> context_data, filter_data = DataProcess.split_at(all_data, 100)
+            >>> skf.initialize_from_context(context_data["y"])
+            >>> filter_prob, states = skf.filter(data=filter_data)
+        """
+
+        self.model["norm_norm"].initialize_from_context(y)
+
     def save_initial_states(self):
         """
         Save current memory from the transition model 'norm_norm' in :attr:`.model`
@@ -976,7 +997,10 @@ class SKF:
         mu_states_transit = self._transition()
         var_states_transit = self._transition()
 
-        if self.lstm_net:
+        # The external predictor is queried once and shared by the 4 transition models.
+        if self.aux_component:
+            mu_lstm_pred, var_lstm_pred = self.aux_component.predict()
+        elif self.lstm_net:
             mu_lstm_input, var_lstm_input = common.prepare_lstm_input(
                 self.model["norm_norm"].lstm_output_history, input_covariates
             )
@@ -992,7 +1016,6 @@ class SKF:
                 self.model["norm_norm"]._estim_hete_noise(
                     mu_v2bar_prior, var_v2bar_prior
                 )
-
         else:
             mu_lstm_pred = None
             var_lstm_pred = None
@@ -1242,6 +1265,8 @@ class SKF:
                 self.model["norm_norm"].update_lstm_states_history(
                     index, last_step=len(data["y"]) - 1
                 )
+            elif self.aux_component:
+                self.model["norm_norm"].update_aux_context(mu_states_posterior)
 
             self._save_states_history()
             self.set_states()
